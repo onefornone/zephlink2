@@ -45,8 +45,7 @@ object ScreenBridge {
                             host.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                         pendingResult = result
                         try {
-                            @Suppress("DEPRECATION")
-                            host.startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_CAPTURE)
+                            startCaptureDialog(host, manager)
                         } catch (error: Exception) {
                             pendingResult = null
                             result.error("failed", "Could not ask for screen permission.", null)
@@ -86,10 +85,15 @@ object ScreenBridge {
                         result.success(false)
                     }
                 }
-                "apply" -> result.success(apply(host, call))
+                "apply" -> result.success(applyInput(host, call))
                 else -> result.notImplemented()
             }
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startCaptureDialog(host: Activity, manager: MediaProjectionManager) {
+        host.startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_CAPTURE)
     }
 
     /** Called from MainActivity. Returns true when the result was ours. */
@@ -135,12 +139,11 @@ object ScreenBridge {
         return (value as? Number)?.toDouble()
     }
 
-    private fun apply(host: Activity, call: MethodCall): Boolean {
+    private fun applyInput(host: Activity, call: MethodCall): Boolean {
         val service = RemoteControlService.instance ?: return false
         val metrics = DisplayMetrics()
         val windows = host.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        @Suppress("DEPRECATION")
-        windows.defaultDisplay.getRealMetrics(metrics)
+        readRealMetrics(windows, metrics)
         val width = metrics.widthPixels.toFloat()
         val height = metrics.heightPixels.toFloat()
         fun unit(key: String): Float {
@@ -164,5 +167,10 @@ object ScreenBridge {
             }
             else -> false
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun readRealMetrics(windows: WindowManager, metrics: DisplayMetrics) {
+        windows.defaultDisplay.getRealMetrics(metrics)
     }
 }

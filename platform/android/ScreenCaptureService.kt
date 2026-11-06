@@ -48,8 +48,7 @@ class ScreenCaptureService : Service() {
         }
         showNotification()
         val resultCode = intent.getIntExtra("resultCode", 0)
-        @Suppress("DEPRECATION")
-        val data = intent.getParcelableExtra<Intent>("data")
+        val data = readCaptureIntent(intent)
         if (data == null) {
             stopSelf()
             return START_NOT_STICKY
@@ -84,8 +83,7 @@ class ScreenCaptureService : Service() {
 
         val metrics = DisplayMetrics()
         val windows = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        @Suppress("DEPRECATION")
-        windows.defaultDisplay.getRealMetrics(metrics)
+        readRealMetrics(windows, metrics)
         val width = metrics.widthPixels
         val height = metrics.heightPixels
         val scale = Math.min(1.0, maxSide.toDouble() / Math.max(width, height).toDouble())
@@ -108,11 +106,13 @@ class ScreenCaptureService : Service() {
     }
 
     private fun onImage(source: ImageReader) {
-        val image = try {
-            source.acquireLatestImage()
+        var found: android.media.Image? = null
+        try {
+            found = source.acquireLatestImage()
         } catch (error: Exception) {
-            null
-        } ?: return
+            found = null
+        }
+        val image = found ?: return
         try {
             val now = SystemClock.elapsedRealtime()
             if (now - lastFrameAt < frameGap) return
@@ -155,12 +155,7 @@ class ScreenCaptureService : Service() {
             channel.description = "Shown while your screen is shared"
             manager.createNotificationChannel(channel)
         }
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
+        val builder = createBuilder()
         builder
             .setContentTitle("Zephlink is sharing your screen")
             .setContentText("Open Zephlink to stop sharing")
@@ -187,6 +182,25 @@ class ScreenCaptureService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun createBuilder(): Notification.Builder {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            Notification.Builder(this)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun readCaptureIntent(intent: Intent): Intent? {
+        return intent.getParcelableExtra<Intent>("data")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun readRealMetrics(windows: WindowManager, metrics: DisplayMetrics) {
+        windows.defaultDisplay.getRealMetrics(metrics)
     }
 
     override fun onDestroy() {
