@@ -67,7 +67,7 @@ class ScreenCaptureService : Service() {
 
     private fun startCapture(resultCode: Int, data: Intent, maxSide: Int) {
         val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val mp = manager.getMediaProjection(resultCode, data)
+        val mp: MediaProjection = manager.getMediaProjection(resultCode, data) ?: return
         projection = mp
 
         val thread = HandlerThread("zephlink-capture")
