@@ -1,0 +1,25 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+pubspec.lock
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Generated platform folders are created by the build workflow
+# (remove these two lines once you commit them yourself)
+/android/
+/windows/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Android signing (never commit these)
+*.jks
+*.keystore
+key.properties

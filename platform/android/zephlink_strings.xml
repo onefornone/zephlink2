@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="zephlink_accessibility_description">Lets a PC you have paired with tap, swipe and type on this phone, but only while you allow it inside Zephlink. Zephlink does not read your screen with this service.</string>
+</resources>

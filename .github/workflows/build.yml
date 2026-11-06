@@ -1,0 +1,145 @@
+name: Build Zephlink
+
+# Runs on every upload to GitHub, and whenever you press "Run workflow".
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # The android/ folder is generated here, so you never have to make it.
+      # Then we put back our own files in case the generator touched them.
+      - name: Create the Android project files
+        shell: bash
+        run: |
+          flutter create --platforms=android --project-name zephlink --org app.zephlink .
+          git checkout -- lib test pubspec.yaml analysis_options.yaml || true
+
+      # Adds network and background permissions and the small native service
+      # that keeps the phone linked when the screen is off.
+      - name: Prepare the Android project
+        run: python3 tools/patch_android.py
+
+      - name: Configure persistent Android signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            if [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
+              echo "::error::Set all four Android signing secrets before building."
+              exit 1
+            fi
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/zephlink-release.jks
+            {
+              printf 'storeFile=zephlink-release.jks\n'
+              printf 'storePassword=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+              printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+              printf 'keyPassword=%s\n' "$ANDROID_KEY_PASSWORD"
+            } > android/key.properties
+          else
+            echo "::warning::No persistent Android signing key configured. Builds use a temporary debug key and cannot update installs signed by another key."
+          fi
+
+      - name: Get packages
+        run: flutter pub get
+
+      # These two only report problems. They never stop the app from building.
+      - name: Check the code (report only)
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run the tests (report only)
+        continue-on-error: true
+        run: flutter test
+
+      - name: Build the APK
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: flutter build apk --release --build-number "$((BUILD_NUMBER + 2))"
+
+      # Shows which signing key this APK has. Updates install over the old app
+      # only when this fingerprint is the same as on the previous build.
+      - name: Show the APK signing fingerprint
+        continue-on-error: true
+        shell: bash
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk | grep -i "SHA-256" || true
+          fi
+
+      - name: Keep the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: zephlink-android-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+  windows:
+    name: Windows app and installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create the Windows project files
+        shell: bash
+        run: |
+          flutter create --platforms=windows --project-name zephlink --org app.zephlink .
+          git checkout -- lib test pubspec.yaml analysis_options.yaml || true
+
+      - name: Set the Windows app icon
+        shell: pwsh
+        run: Copy-Item assets/zephlink.ico windows/runner/resources/app_icon.ico -Force
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Build the Windows app
+        run: flutter build windows --release
+
+      - name: Zip the app
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath dist/Zephlink-windows.zip
+
+      - name: Make the installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc installer/zephlink.iss
+          Copy-Item build/installer/Zephlink-Setup.exe dist/Zephlink-Setup.exe
+
+      - name: Keep the Windows files
+        uses: actions/upload-artifact@v4
+        with:
+          name: zephlink-windows
+          path: dist/*
