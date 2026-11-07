@@ -22,6 +22,7 @@ class AndroidScreen {
     required int fps,
     required void Function(Uint8List jpeg) onFrame,
     void Function()? onStopped,
+    void Function()? onVideoFailed,
   }) async {
     if (!supported) return 'This is not an Android phone.';
     try {
@@ -31,6 +32,8 @@ class AndroidScreen {
           onFrame(event);
         } else if (event == 'stopped') {
           onStopped?.call();
+        } else if (event == 'h264-failed') {
+          onVideoFailed?.call();
         }
       });
       final ok = await _screen.invokeMethod<bool>('start', <String, dynamic>{
@@ -49,6 +52,85 @@ class AndroidScreen {
     } catch (_) {
       await stop();
       return 'Could not start screen sharing.';
+    }
+  }
+
+  /// Switches the phone between small pictures ("jpeg") and H.264 video
+  /// ("h264"). Returns false when the phone could not do it.
+  static Future<bool> setCodec(String mode) async {
+    if (!supported) return false;
+    try {
+      return await _screen.invokeMethod<bool>(
+            'codec',
+            <String, dynamic>{'mode': mode},
+          ) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Asks the video encoder for a full picture, so a viewer can (re)start.
+  static Future<void> requestKeyFrame() async {
+    if (!supported) return;
+    try {
+      await _screen.invokeMethod<bool>('keyframe');
+    } catch (_) {
+      // Not sharing.
+    }
+  }
+
+  /// Whether Zephlink may open screens while it is in the background.
+  static Future<bool> overlayAllowed() async {
+    if (!supported) return true;
+    try {
+      return await _control.invokeMethod<bool>('overlayAllowed') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> openOverlaySettings() async {
+    if (!supported) return;
+    try {
+      await _control.invokeMethod<bool>('openOverlaySettings');
+    } catch (_) {
+      // Settings did not open.
+    }
+  }
+
+  /// Runs a one-tap action such as "lock" or "files". Returns null when it
+  /// worked, or a short reason when it did not.
+  static Future<String?> quick(String action, {String? argument}) async {
+    if (!supported) return 'This is not an Android phone.';
+    try {
+      return await _control.invokeMethod<String>(
+        'quick',
+        <String, dynamic>{'a': action, 's': argument},
+      );
+    } catch (_) {
+      return 'Could not do that.';
+    }
+  }
+
+  /// The apps on this phone that have a launcher icon.
+  static Future<List<Map<String, String>>> listApps() async {
+    if (!supported) return const [];
+    try {
+      final raw = await _control.invokeMethod<List<dynamic>>('apps');
+      final out = <Map<String, String>>[];
+      for (final item in raw ?? const <dynamic>[]) {
+        if (item is Map) {
+          final label = item['label'];
+          final pkg = item['pkg'];
+          if (label is String && pkg is String) {
+            out.add(<String, String>{'label': label, 'pkg': pkg});
+          }
+        }
+      }
+      return out;
+    } catch (_) {
+      return const [];
     }
   }
 

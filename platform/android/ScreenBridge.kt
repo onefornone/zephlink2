@@ -32,6 +32,7 @@ object ScreenBridge {
     private val main = Handler(Looper.getMainLooper())
 
     fun register(host: Activity, messenger: BinaryMessenger) {
+        ToolsBridge.register(host, messenger)
         MethodChannel(messenger, "zephlink/screen").setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
@@ -54,6 +55,15 @@ object ScreenBridge {
                 }
                 "stop" -> {
                     host.stopService(Intent(host, ScreenCaptureService::class.java))
+                    result.success(true)
+                }
+                "codec" -> {
+                    val service = ScreenCaptureService.instance
+                    val mode = call.argument<String>("mode") ?: "jpeg"
+                    result.success(service?.setCodec(mode) ?: false)
+                }
+                "keyframe" -> {
+                    ScreenCaptureService.instance?.requestKeyFrame()
                     result.success(true)
                 }
                 else -> result.notImplemented()
@@ -86,6 +96,10 @@ object ScreenBridge {
                     }
                 }
                 "apply" -> result.success(applyInput(host, call))
+                "overlayAllowed" -> result.success(QuickActions.canDrawOverApps(host))
+                "openOverlaySettings" -> result.success(QuickActions.openOverlaySettings(host))
+                "quick" -> result.success(QuickActions.run(host, call.argument<String>("a") ?: "", call.argument<String>("s")))
+                "apps" -> result.success(QuickActions.apps(host))
                 else -> result.notImplemented()
             }
         }
@@ -127,6 +141,11 @@ object ScreenBridge {
     /** Sends one picture to the app. Safe to call from any thread. */
     fun emitFrame(bytes: ByteArray) {
         main.post { sink?.success(bytes) }
+    }
+
+    /** Sends a short note (such as "h264-failed") to the app. */
+    fun emitText(text: String) {
+        main.post { sink?.success(text) }
     }
 
     /** Tells the app that sharing ended (for example from the Android chip). */

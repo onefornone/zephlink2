@@ -13,14 +13,19 @@ import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.DisplayMetrics
+import android.view.Surface
 import android.view.WindowManager
 import java.io.ByteArrayOutputStream
 
@@ -38,6 +43,20 @@ class ScreenCaptureService : Service() {
     private var frameGap = 100L
     private var quality = 65
     private var stopping = false
+    private var outWidth = 0
+    private var outHeight = 0
+    private var fps = 10
+    private var encoder: MediaCodec? = null
+    private var encoderSurface: Surface? = null
+    private var encoderThread: Thread? = null
+
+    @Volatile
+    private var encoding = false
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -55,7 +74,7 @@ class ScreenCaptureService : Service() {
         }
         val maxSide = intent.getIntExtra("maxSide", 1080).coerceIn(320, 2560)
         quality = intent.getIntExtra("quality", 65).coerceIn(10, 95)
-        val fps = intent.getIntExtra("fps", 10).coerceIn(1, 30)
+        fps = intent.getIntExtra("fps", 10).coerceIn(1, 30)
         frameGap = 1000L / fps
         try {
             startCapture(resultCode, data, maxSide)
@@ -87,8 +106,9 @@ class ScreenCaptureService : Service() {
         val width = metrics.widthPixels
         val height = metrics.heightPixels
         val scale = Math.min(1.0, maxSide.toDouble() / Math.max(width, height).toDouble())
-        val outWidth = Math.max(2, (width * scale).toInt() and 1.inv())
-        val outHeight = Math.max(2, (height * scale).toInt() and 1.inv())
+        // Multiples of 16 keep every phone's video encoder happy.
+        outWidth = Math.max(16, (width * scale).toInt() and 15.inv())
+        outHeight = Math.max(16, (height * scale).toInt() and 15.inv())
 
         val images = ImageReader.newInstance(outWidth, outHeight, PixelFormat.RGBA_8888, 2)
         reader = images
@@ -103,6 +123,141 @@ class ScreenCaptureService : Service() {
             handler
         )
         images.setOnImageAvailableListener({ source -> onImage(source) }, handler)
+    }
+
+    /** Switches between small JPEG pictures ("jpeg") and H.264 video ("h264"). */
+    @Synchronized
+    fun setCodec(mode: String): Boolean {
+        val screen = display ?: return false
+        val pictures = reader ?: return false
+        if (mode == "h264") {
+            if (encoding) return true
+            return try {
+                startEncoder(screen)
+                true
+            } catch (error: Exception) {
+                stopEncoder()
+                try {
+                    screen.surface = pictures.surface
+                } catch (inner: Exception) {
+                    // Keep going with whatever surface is attached.
+                }
+                false
+            }
+        }
+        stopEncoder()
+        try {
+            screen.surface = pictures.surface
+        } catch (error: Exception) {
+            return false
+        }
+        return true
+    }
+
+    @Synchronized
+    fun requestKeyFrame() {
+        val codec = encoder ?: return
+        if (!encoding) return
+        try {
+            val params = Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            codec.setParameters(params)
+        } catch (error: Exception) {
+            // Not available right now.
+        }
+    }
+
+    private fun startEncoder(screen: VirtualDisplay) {
+        val pixels = outWidth.toLong() * outHeight.toLong()
+        val bitrate = (pixels * 30L / 4L).coerceIn(1_500_000L, 10_000_000L).toInt()
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outWidth, outHeight)
+        format.setInteger(
+            MediaFormat.KEY_COLOR_FORMAT,
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+        )
+        format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+        try {
+            format.setFloat("max-fps-to-encoder", Math.max(fps, 15).toFloat())
+        } catch (error: Exception) {
+            // Optional hint only.
+        }
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val surface = codec.createInputSurface()
+        codec.start()
+        encoder = codec
+        encoderSurface = surface
+        encoding = true
+        screen.surface = surface
+        val thread = Thread { drainEncoder(codec) }
+        thread.name = "zephlink-encoder"
+        encoderThread = thread
+        thread.start()
+    }
+
+    private fun drainEncoder(codec: MediaCodec) {
+        val info = MediaCodec.BufferInfo()
+        var config: ByteArray? = null
+        try {
+            while (encoding) {
+                val index = codec.dequeueOutputBuffer(info, 100_000L)
+                if (index < 0) continue
+                val buffer = codec.getOutputBuffer(index)
+                if (buffer != null && info.size > 0) {
+                    buffer.position(info.offset)
+                    buffer.limit(info.offset + info.size)
+                    val bytes = ByteArray(info.size)
+                    buffer.get(bytes)
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        config = bytes
+                    } else {
+                        val key = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                        val head = config
+                        val payload = if (key && head != null) head + bytes else bytes
+                        val out = ByteArray(payload.size + 1)
+                        out[0] = if (key) 2 else 3
+                        System.arraycopy(payload, 0, out, 1, payload.size)
+                        ScreenBridge.emitFrame(out)
+                    }
+                }
+                codec.releaseOutputBuffer(index, false)
+            }
+        } catch (error: Exception) {
+            if (encoding) ScreenBridge.emitText("h264-failed")
+        }
+    }
+
+    @Synchronized
+    private fun stopEncoder() {
+        encoding = false
+        val codec = encoder
+        val surface = encoderSurface
+        val thread = encoderThread
+        encoder = null
+        encoderSurface = null
+        encoderThread = null
+        try {
+            thread?.join(300)
+        } catch (error: Exception) {
+            // Moving on.
+        }
+        try {
+            codec?.stop()
+        } catch (error: Exception) {
+            // Already stopped.
+        }
+        try {
+            codec?.release()
+        } catch (error: Exception) {
+            // Already released.
+        }
+        try {
+            surface?.release()
+        } catch (error: Exception) {
+            // Already released.
+        }
     }
 
     private fun onImage(source: ImageReader) {
@@ -206,6 +361,8 @@ class ScreenCaptureService : Service() {
     override fun onDestroy() {
         if (!stopping) {
             stopping = true
+            instance = null
+            stopEncoder()
             try {
                 reader?.setOnImageAvailableListener(null, null)
                 display?.release()
@@ -225,6 +382,9 @@ class ScreenCaptureService : Service() {
     }
 
     companion object {
+        @Volatile
+        var instance: ScreenCaptureService? = null
+
         private const val CHANNEL_ID = "zephlink_screen"
         private const val NOTIFICATION_ID = 4712
     }

@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../features/device_tools.dart';
 import '../features/screen_remote.dart';
 import '../features/transfer_hub.dart';
 import '../platform/android_notification_forwarder.dart';
@@ -40,6 +41,7 @@ class LinkController extends ChangeNotifier {
       ask: askConsent,
       peerName: () => _active?.name ?? 'The other device',
       peerPlatform: () => _active?.platform ?? 'other',
+      prefs: prefs,
     );
     remote.addListener(_notify);
     hub = TransferHub(
@@ -48,6 +50,13 @@ class LinkController extends ChangeNotifier {
       onFileReceived: (item) => _showReceivedNotification(item),
       autoReceive: () => _autoReceive,
     );
+    tools = DeviceToolsService(
+      ask: askConsent,
+      peerName: () => _active?.name ?? 'The other device',
+      sendFile: (path) => hub.sendFiles([XFile(path)]),
+      prefs: prefs,
+    );
+    tools.addListener(_notify);
   }
 
   final Future<void> Function(TransferItem item, String from)? onFileReceived;
@@ -59,6 +68,9 @@ class LinkController extends ChangeNotifier {
 
   /// Screen mirroring and remote control.
   late final ScreenRemoteService remote;
+
+  /// Find my phone and browsing files on the other device.
+  late final DeviceToolsService tools;
 
   late String _name;
   late bool _quickConnect;
@@ -321,6 +333,8 @@ class LinkController extends ChangeNotifier {
     hub.detach();
     remote.removeListener(_notify);
     remote.dispose();
+    tools.removeListener(_notify);
+    tools.dispose();
     _session?.close();
     super.dispose();
   }
@@ -763,6 +777,7 @@ class LinkController extends ChangeNotifier {
     // Subscribe first, then start reading, so no message is missed.
     hub.attach(session);
     remote.attach(session);
+    tools.attach(session);
     unawaited(_messageSub?.cancel());
     _messageSub = session.messages.listen(_onMessage);
     session.start();
@@ -847,6 +862,7 @@ class LinkController extends ChangeNotifier {
     _latency = null;
     hub.detach();
     remote.detach();
+    tools.detach();
     unawaited(_messageSub?.cancel());
     _messageSub = null;
     _clipTimer?.cancel();
@@ -882,6 +898,12 @@ class LinkController extends ChangeNotifier {
   void cancelTransfer(TransferItem item) => hub.cancel(item);
 
   Future<void> resumeTransfer(TransferItem item) => hub.resume(item);
+
+  /// Sends a failed or cancelled file again. Null when it was queued.
+  Future<String?> resendTransfer(TransferItem item) => hub.resend(item);
+
+  /// Sends every failed file again. Returns how many were queued.
+  Future<int> resendAllFailed() => hub.resendFailed();
 
   void clearFinishedTransfers() => hub.clearFinished();
 

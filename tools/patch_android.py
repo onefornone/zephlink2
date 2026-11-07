@@ -19,6 +19,9 @@ PERMISSIONS = [
     'POST_NOTIFICATIONS',
     'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
     'CAMERA',
+    'SYSTEM_ALERT_WINDOW',
+    'MANAGE_EXTERNAL_STORAGE',
+    'READ_EXTERNAL_STORAGE',
 ]
 
 # Find the app's code folder and package name that flutter create made.
@@ -35,8 +38,10 @@ for name in (
     'KeepAliveService.kt',
     'NotificationForwardingService.kt',
     'ScreenBridge.kt',
+    'QuickActions.kt',
     'ScreenCaptureService.kt',
     'RemoteControlService.kt',
+    'ToolsBridge.kt',
 ):
     text = open(os.path.join('platform/android', name), encoding='utf-8').read()
     text = re.sub(r'^package\s+[\w.]+', 'package ' + package, text, count=1, flags=re.M)
@@ -52,6 +57,16 @@ perms = ''.join(
 )
 if perms:
     s = s.replace('<application', perms + '    <application', 1)
+if 'android.intent.category.LAUNCHER' not in s.split('<application')[0]:
+    queries = (
+        '    <queries>\n'
+        '        <intent>\n'
+        '            <action android:name="android.intent.action.MAIN" />\n'
+        '            <category android:name="android.intent.category.LAUNCHER" />\n'
+        '        </intent>\n'
+        '    </queries>\n'
+    )
+    s = s.replace('<application', queries + '    <application', 1)
 service = (
     '        <service android:name="%s.KeepAliveService" android:exported="false"\n'
     '            android:foregroundServiceType="connectedDevice"/>\n' % package

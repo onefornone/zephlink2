@@ -128,8 +128,27 @@ jobs:
       - name: Get packages
         run: flutter pub get
 
+      # First try with the smooth H.264 video player (media_kit). If that part
+      # cannot be added or built, build the normal app without it, so a
+      # problem there never stops the Windows app from being made.
       - name: Build the Windows app
-        run: flutter build windows --release
+        shell: bash
+        run: |
+          set -o pipefail
+          cp platform/windows/h264_viewer.dart lib/platform/h264_viewer.dart
+          if flutter pub add media_kit media_kit_video media_kit_libs_windows_video \
+             && flutter build windows --release 2>&1 | tee build-h264.log; then
+            echo "Built with the H.264 video player."
+          else
+            echo "::warning::The H.264 video player could not be built. Building without it (simple video is used)."
+            (grep -E "error|Error" build-h264.log || true) | head -15 | while IFS= read -r line; do
+              echo "::warning::$line"
+            done
+            git checkout -- pubspec.yaml lib/platform/h264_viewer.dart
+            rm -rf build/windows pubspec.lock
+            flutter pub get
+            flutter build windows --release
+          fi
 
       - name: Zip the app
         shell: pwsh

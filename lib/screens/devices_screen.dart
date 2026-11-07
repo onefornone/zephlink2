@@ -570,6 +570,24 @@ class _ConnectCardState extends State<_ConnectCard> {
   }
 }
 
+/// Opens the camera, scans a Zephlink pairing QR code and pairs with it.
+/// Used by the Home screen and the Devices screen on the phone.
+Future<void> scanPairingQr(BuildContext context, LinkController link) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final payload = await Navigator.of(context).push<String>(
+    MaterialPageRoute<String>(
+      builder: (_) => const _PairQrScannerScreen(),
+    ),
+  );
+  if (payload == null) return;
+  final error = await link.pairFromQr(payload);
+  messenger
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(content: Text(error ?? 'Pairing approved and device remembered.')),
+    );
+}
+
 class _PairQrScannerScreen extends StatefulWidget {
   const _PairQrScannerScreen();
 

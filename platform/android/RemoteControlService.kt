@@ -54,6 +54,16 @@ class RemoteControlService : AccessibilityService() {
             "home" -> GLOBAL_ACTION_HOME
             "recents" -> GLOBAL_ACTION_RECENTS
             "notifications" -> GLOBAL_ACTION_NOTIFICATIONS
+            "quicksettings" -> GLOBAL_ACTION_QUICK_SETTINGS
+            "power" -> GLOBAL_ACTION_POWER_DIALOG
+            "lock" -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+                GLOBAL_ACTION_LOCK_SCREEN
+            }
+            "screenshot" -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+                GLOBAL_ACTION_TAKE_SCREENSHOT
+            }
             else -> return false
         }
         return performGlobalAction(code)

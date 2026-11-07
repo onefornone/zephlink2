@@ -25,6 +25,13 @@ class _ApprovalHostState extends State<ApprovalHost> {
   BuildContext? _dialogContext;
   bool _consentShowing = false;
   BuildContext? _consentContext;
+  bool _consentClosing = false;
+  bool _pairClosing = false;
+
+  static const AnimationStyle _quick = AnimationStyle(
+    duration: Duration(milliseconds: 120),
+    reverseDuration: Duration(milliseconds: 60),
+  );
 
   @override
   void initState() {
@@ -43,7 +50,11 @@ class _ApprovalHostState extends State<ApprovalHost> {
     final request = widget.link.pendingConsent;
     if (request == null) {
       final dialog = _consentContext;
-      if (_consentShowing && dialog != null && dialog.mounted) {
+      if (_consentShowing &&
+          !_consentClosing &&
+          dialog != null &&
+          dialog.mounted) {
+        _consentClosing = true;
         Navigator.of(dialog).pop();
       }
       return;
@@ -58,9 +69,21 @@ class _ApprovalHostState extends State<ApprovalHost> {
         return;
       }
       var option = false;
+      _consentClosing = false;
+      var answered = false;
+      void answer(BuildContext dialogContext, bool allow) {
+        if (answered) return;
+        answered = true;
+        _consentClosing = true;
+        // Answer first, then close, so the other device is told straight away.
+        widget.link.answerConsent(allow, allow && option);
+        if (dialogContext.mounted) Navigator.of(dialogContext).pop(allow);
+      }
+
       final allow = await showDialog<bool>(
         context: context,
         barrierDismissible: false,
+        animationStyle: _quick,
         builder: (dialogContext) {
           _consentContext = dialogContext;
           return StatefulBuilder(
@@ -91,11 +114,11 @@ class _ApprovalHostState extends State<ApprovalHost> {
                 ),
                 actions: [
                   TextButton(
-                    onPressed: () => Navigator.of(dialogContext).pop(false),
+                    onPressed: () => answer(dialogContext, false),
                     child: const Text('Deny'),
                   ),
                   FilledButton(
-                    onPressed: () => Navigator.of(dialogContext).pop(true),
+                    onPressed: () => answer(dialogContext, true),
                     child: Text(request.allowLabel),
                   ),
                 ],
@@ -105,7 +128,10 @@ class _ApprovalHostState extends State<ApprovalHost> {
         },
       );
       _consentContext = null;
-      widget.link.answerConsent(allow == true, allow == true && option);
+      if (!answered) {
+        answered = true;
+        widget.link.answerConsent(allow == true, allow == true && option);
+      }
       _consentShowing = false;
       _checkConsent();
     });
@@ -117,7 +143,8 @@ class _ApprovalHostState extends State<ApprovalHost> {
     if (request == null) {
       // The question timed out or was answered elsewhere: close the dialog.
       final dialog = _dialogContext;
-      if (_showing && dialog != null && dialog.mounted) {
+      if (_showing && !_pairClosing && dialog != null && dialog.mounted) {
+        _pairClosing = true;
         Navigator.of(dialog).pop();
       }
       return;
@@ -131,9 +158,20 @@ class _ApprovalHostState extends State<ApprovalHost> {
         widget.link.answerRequest(false);
         return;
       }
+      _pairClosing = false;
+      var answered = false;
+      void answer(BuildContext dialogContext, bool allow) {
+        if (answered) return;
+        answered = true;
+        _pairClosing = true;
+        widget.link.answerRequest(allow);
+        if (dialogContext.mounted) Navigator.of(dialogContext).pop(allow);
+      }
+
       final allow = await showDialog<bool>(
         context: context,
         barrierDismissible: false,
+        animationStyle: _quick,
         builder: (dialogContext) {
           _dialogContext = dialogContext;
           return AlertDialog(
@@ -191,11 +229,11 @@ class _ApprovalHostState extends State<ApprovalHost> {
                   ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(false),
+                onPressed: () => answer(dialogContext, false),
                 child: const Text('Deny'),
               ),
               FilledButton(
-                onPressed: () => Navigator.of(dialogContext).pop(true),
+                onPressed: () => answer(dialogContext, true),
                 child: Text(
                   request.reconnecting
                       ? 'Approve connection'
@@ -209,7 +247,10 @@ class _ApprovalHostState extends State<ApprovalHost> {
         },
       );
       _dialogContext = null;
-      widget.link.answerRequest(allow == true);
+      if (!answered) {
+        answered = true;
+        widget.link.answerRequest(allow == true);
+      }
       _showing = false;
       _check();
     });

@@ -348,9 +348,9 @@ class TransferHub {
     } finally {
       hasherToFree?.dispose();
       _outgoing.remove(item.id);
-      if (item.state == TransferState.done ||
-          item.state == TransferState.failed ||
-          item.state == TransferState.cancelled) {
+      // A failed or cancelled file is kept so it can be sent again. It is
+      // cleaned up when the list is cleared or the resend succeeds.
+      if (item.state == TransferState.done) {
         await _cleanupPickedFile(file);
       }
     }
@@ -496,7 +496,61 @@ class TransferHub {
     _queue = _queue.then((_) => _sendOne(session, item, XFile(path)));
   }
 
+  /// Sends a failed or cancelled file again as a new transfer. Returns null
+  /// when it was queued, or a short reason when it could not be.
+  Future<String?> resend(TransferItem item) async {
+    final session = _session;
+    if (!item.outgoing ||
+        (item.state != TransferState.failed &&
+            item.state != TransferState.cancelled)) {
+      return null;
+    }
+    if (session == null || session.isClosed) {
+      return 'Connect to the other device first.';
+    }
+    final path = item.path;
+    if (path == null) return 'The original file is unavailable.';
+    try {
+      final file = File(path);
+      if (!await file.exists() || await file.length() != item.size) {
+        return 'The original file is no longer there. Send it again from Files.';
+      }
+    } catch (_) {
+      return 'The original file is unavailable.';
+    }
+    items.remove(item);
+    _changed();
+    await sendSources(<TransferSource>[
+      TransferSource(file: XFile(path), relativePath: item.relativePath),
+    ]);
+    return null;
+  }
+
+  /// Sends all failed or cancelled files again. Returns how many were queued.
+  Future<int> resendFailed() async {
+    final failed = items
+        .where((item) =>
+            item.outgoing &&
+            (item.state == TransferState.failed ||
+                item.state == TransferState.cancelled))
+        .toList();
+    var queued = 0;
+    for (final item in failed) {
+      if (await resend(item) == null) queued++;
+    }
+    return queued;
+  }
+
   void clearFinished() {
+    for (final item in items) {
+      final path = item.path;
+      if (item.outgoing &&
+          path != null &&
+          (item.state == TransferState.failed ||
+              item.state == TransferState.cancelled)) {
+        unawaited(_cleanupPickedFile(XFile(path)));
+      }
+    }
     items.removeWhere(
       (item) =>
           item.state == TransferState.done ||

@@ -7,10 +7,14 @@ import '../link/link_controller.dart';
 import '../link/models.dart';
 import '../theme/zeph_colors.dart';
 import '../widgets/format.dart';
+import '../widgets/pair_qr.dart';
+import '../widgets/resend.dart';
 import '../widgets/transfer_preview.dart';
 import '../widgets/widgets.dart';
 import 'devices_screen.dart';
 import 'files_screen.dart';
+import 'remote_screen.dart';
+import 'screen_screen.dart';
 
 /// Home / Connect tab: the state of your link, quick actions and recent files.
 class ConnectScreen extends StatelessWidget {
@@ -88,14 +92,18 @@ class ConnectScreen extends StatelessWidget {
                 ActionTile(
                   icon: Icons.screen_share_outlined,
                   title: 'Mirror',
-                  subtitle: 'Coming in a later build',
-                  onTap: () => comingSoon(context, 'Screen mirroring'),
+                  subtitle: peer != null
+                      ? 'See or share a screen'
+                      : 'Connect a device first',
+                  onTap: () => _open(context, 'Screen', const ScreenScreen()),
                 ),
                 ActionTile(
                   icon: Icons.mouse_outlined,
                   title: 'Remote',
-                  subtitle: 'Coming in a later build',
-                  onTap: () => comingSoon(context, 'Remote control'),
+                  subtitle: peer != null
+                      ? 'Control ${peer.name}'
+                      : 'Connect a device first',
+                  onTap: () => _open(context, 'Remote', const RemoteScreen()),
                 ),
               ],
             ),
@@ -225,15 +233,47 @@ class HeroCard extends StatelessWidget {
               ],
             )
           else
-            FilledButton(
-              onPressed: () => openDevices(context),
-              style: FilledButton.styleFrom(
-                backgroundColor: Colors.white,
-                foregroundColor: const Color(0xFF00455A),
-              ),
-              child: Text(
-                status == LinkStatus.unpaired ? 'Connect a device' : 'Manage devices',
-              ),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton(
+                  onPressed: () => openDevices(context),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    foregroundColor: const Color(0xFF00455A),
+                  ),
+                  child: Text(
+                    status == LinkStatus.unpaired
+                        ? 'Connect a device'
+                        : 'Manage devices',
+                  ),
+                ),
+                if (phone)
+                  OutlinedButton.icon(
+                    onPressed: () => scanPairingQr(context, link),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white70),
+                    ),
+                    icon: const Icon(Icons.qr_code_scanner_rounded),
+                    label: const Text('Scan QR code'),
+                  )
+                else
+                  OutlinedButton.icon(
+                    onPressed: () => showPairQrDialog(
+                      context,
+                      link,
+                      onEnterCode: () => openDevices(context),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white70),
+                    ),
+                    icon: const Icon(Icons.qr_code_2_rounded),
+                    label: const Text('Show QR code'),
+                  ),
+              ],
             ),
         ],
       ),
@@ -332,6 +372,16 @@ class RecentTransfersCard extends StatelessWidget {
                             tooltip: 'Cancel transfer',
                             icon: const Icon(Icons.close_rounded),
                             onPressed: () => link.cancelTransfer(item),
+                          )
+                        else if (item.outgoing &&
+                            (item.state == TransferState.failed ||
+                                item.state == TransferState.cancelled))
+                          IconButton(
+                            tooltip: 'Send again',
+                            icon: const Icon(Icons.replay_rounded),
+                            onPressed: link.activePeer == null
+                                ? null
+                                : () => resendWithMessage(context, link, item),
                           )
                         else if (item.state == TransferState.done &&
                             item.path != null)

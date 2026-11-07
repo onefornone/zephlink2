@@ -23,6 +23,8 @@ typedef _KeybdEventC = Void Function(Uint8, Uint8, Uint32, IntPtr);
 typedef _KeybdEventD = void Function(int, int, int, int);
 typedef _SendInputC = Uint32 Function(Uint32, Pointer<Uint8>, Int32);
 typedef _SendInputD = int Function(int, Pointer<Uint8>, int);
+typedef _PostMessageC = Int32 Function(IntPtr, Uint32, IntPtr, IntPtr);
+typedef _PostMessageD = int Function(int, int, int, int);
 typedef _GetDcC = IntPtr Function(IntPtr);
 typedef _GetDcD = int Function(int);
 typedef _ReleaseDcC = Int32 Function(IntPtr, IntPtr);
@@ -112,6 +114,7 @@ class WindowsInput {
     _mouse = user32.lookupFunction<_MouseEventC, _MouseEventD>('mouse_event');
     _key = user32.lookupFunction<_KeybdEventC, _KeybdEventD>('keybd_event');
     _sendInput = user32.lookupFunction<_SendInputC, _SendInputD>('SendInput');
+    _post = user32.lookupFunction<_PostMessageC, _PostMessageD>('PostMessageW');
   }
 
   /// Null when this is not Windows or Windows could not be reached.
@@ -129,6 +132,13 @@ class WindowsInput {
   late final _MouseEventD _mouse;
   late final _KeybdEventD _key;
   late final _SendInputD _sendInput;
+  late final _PostMessageD _post;
+
+  /// Turns the monitors off (they wake again when the mouse moves).
+  void screenOff() {
+    // HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2 = off.
+    _post(0xFFFF, 0x0112, 0xF170, 2);
+  }
 
   static const int _leftDown = 0x0002;
   static const int _leftUp = 0x0004;

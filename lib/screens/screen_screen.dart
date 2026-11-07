@@ -1,12 +1,18 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../app_scope.dart';
 import '../features/screen_remote.dart';
 import '../link/link_controller.dart';
 import '../platform/android_screen.dart';
+import '../platform/h264_viewer.dart';
+import '../widgets/quick_actions.dart';
 import '../widgets/widgets.dart';
 import 'devices_screen.dart';
 
@@ -79,6 +85,7 @@ class _ShareControlsState extends State<_ShareControls>
     with WidgetsBindingObserver {
   bool _allowControl = false;
   bool _serviceOn = true;
+  bool _overlayOn = true;
 
   @override
   void initState() {
@@ -101,7 +108,13 @@ class _ShareControlsState extends State<_ShareControls>
   Future<void> _refreshService() async {
     if (!AndroidScreen.supported) return;
     final on = await AndroidScreen.controlEnabled();
-    if (mounted) setState(() => _serviceOn = on);
+    final overlay = await AndroidScreen.overlayAllowed();
+    if (mounted) {
+      setState(() {
+        _serviceOn = on;
+        _overlayOn = overlay;
+      });
+    }
   }
 
   @override
@@ -148,6 +161,22 @@ class _ShareControlsState extends State<_ShareControls>
                     'here, and can control it only if they allow that.',
                     style: tt.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
                   ),
+                  ToggleRow(
+                    title: 'Open their screen automatically',
+                    subtitle: 'As soon as we are linked, ask to see it. '
+                        'Works with "view anytime" turned on there.',
+                    value: remote.autoView,
+                    onChanged: remote.setAutoView,
+                  ),
+                  if (remote.canH264)
+                    ToggleRow(
+                      title: 'Smooth video (H.264)',
+                      subtitle: 'Much less Wi-Fi and smoother. Experimental: '
+                          'it switches back to simple video by itself if it '
+                          'does not start.',
+                      value: remote.preferH264,
+                      onChanged: remote.setPreferH264,
+                    ),
                   const SizedBox(height: 12),
                   if (remote.waiting)
                     Row(
@@ -210,6 +239,16 @@ class _ShareControlsState extends State<_ShareControls>
                     ),
                     const SizedBox(height: 8),
                     ToggleRow(
+                      title: 'Let $peerName view this screen anytime',
+                      subtitle: AndroidScreen.supported
+                          ? 'View only, no questions asked. Android still shows '
+                              'its own "Start now" box each time sharing begins.'
+                          : 'View only, no questions asked, whenever the '
+                              'linked device asks. Control is always asked.',
+                      value: remote.alwaysAllowView,
+                      onChanged: remote.setAlwaysAllowView,
+                    ),
+                    ToggleRow(
                       title: 'Allow $peerName to control this device',
                       subtitle: AndroidScreen.supported
                           ? 'Taps and swipes. Needs the remote control '
@@ -224,6 +263,17 @@ class _ShareControlsState extends State<_ShareControls>
                             }
                           : (on) => setState(() => _allowControl = on),
                     ),
+                    if (AndroidScreen.supported && !_overlayOn)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4, bottom: 8),
+                        child: FilledButton.tonalIcon(
+                          onPressed: AndroidScreen.openOverlaySettings,
+                          icon: const Icon(Icons.layers_outlined),
+                          label: const Text(
+                            'Allow opening apps and files from the PC',
+                          ),
+                        ),
+                      ),
                     if (AndroidScreen.supported && !_serviceOn)
                       Padding(
                         padding: const EdgeInsets.only(top: 4, bottom: 8),
@@ -267,11 +317,15 @@ class _ViewerPage extends StatefulWidget {
     required this.remote,
     required this.peerPlatform,
     required this.peerName,
+    this.fullscreen = false,
   });
 
   final ScreenRemoteService remote;
   final String peerPlatform;
   final String peerName;
+
+  /// True on the full-screen page (no tab bar, controls float on top).
+  final bool fullscreen;
 
   @override
   State<_ViewerPage> createState() => _ViewerPageState();
@@ -288,9 +342,16 @@ class _ViewerPageState extends State<_ViewerPage> {
   DateTime? _downTime;
   Offset? _lastAt;
 
+  bool _hideBar = false;
+  bool _rotated = false;
+  bool _landscape = false;
+
   @override
   void dispose() {
     _text.dispose();
+    if (_rotated) {
+      unawaited(SystemChrome.setPreferredOrientations(const <DeviceOrientation>[]));
+    }
     super.dispose();
   }
 
@@ -400,7 +461,51 @@ class _ViewerPageState extends State<_ViewerPage> {
     );
   }
 
+  Widget _overlay(Size area) {
+    if (_peerIsAndroid) {
+      return Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: _androidDown,
+        onPointerMove: _androidMove,
+        onPointerUp: (event) => _androidUp(event, area),
+        onPointerSignal: (event) => _androidSignal(event, area),
+        child: const SizedBox.expand(),
+      );
+    }
+    return _windowsOverlay(area);
+  }
+
+  Widget _videoPicture(H264Viewer video) {
+    return ValueListenableBuilder<Size?>(
+      valueListenable: video.size,
+      builder: (context, size, _) {
+        final ratio = (size == null || size.height <= 0)
+            ? 9 / 16
+            : size.width / size.height;
+        return AspectRatio(
+          aspectRatio: ratio,
+          child: LayoutBuilder(
+            builder: (context, box) {
+              final area = Size(box.maxWidth, box.maxHeight);
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  video.buildView(),
+                  if (widget.remote.peerControl) _overlay(area),
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
   Widget _picture() {
+    final video = widget.remote.video;
+    if (widget.remote.codec == 'h264' && video != null) {
+      return _videoPicture(video);
+    }
     return ValueListenableBuilder<Uint8List?>(
       valueListenable: widget.remote.frame,
       builder: (context, bytes, _) {
@@ -425,18 +530,7 @@ class _ViewerPageState extends State<_ViewerPage> {
                     gaplessPlayback: true,
                     filterQuality: FilterQuality.medium,
                   ),
-                  if (widget.remote.peerControl)
-                    _peerIsAndroid
-                        ? Listener(
-                            behavior: HitTestBehavior.opaque,
-                            onPointerDown: _androidDown,
-                            onPointerMove: _androidMove,
-                            onPointerUp: (event) => _androidUp(event, area),
-                            onPointerSignal: (event) =>
-                                _androidSignal(event, area),
-                            child: const SizedBox.expand(),
-                          )
-                        : _windowsOverlay(area),
+                  if (widget.remote.peerControl) _overlay(area),
                 ],
               );
             },
@@ -447,6 +541,25 @@ class _ViewerPageState extends State<_ViewerPage> {
   }
 
   Widget _toolbar(BuildContext context) {
+    final remote = widget.remote;
+    final bar = _controlsBar(context);
+    if (remote.codec != 'h264') return bar;
+    return Column(
+      children: [
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: () => remote.useSimpleVideo(),
+            icon: const Icon(Icons.image_outlined),
+            label: const Text('Video looks wrong? Switch to simple video'),
+          ),
+        ),
+        bar,
+      ],
+    );
+  }
+
+  Widget _controlsBar(BuildContext context) {
     final remote = widget.remote;
     if (!remote.peerControl) {
       return Padding(
@@ -540,39 +653,313 @@ class _ViewerPageState extends State<_ViewerPage> {
     _text.clear();
   }
 
+  // -- Extra controls ------------------------------------------------------
+
+  static Future<void> _systemFullscreen(bool on) async {
+    try {
+      if (Platform.isWindows) {
+        await windowManager.setFullScreen(on);
+      } else if (Platform.isAndroid) {
+        await SystemChrome.setEnabledSystemUIMode(
+          on ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+        );
+      }
+    } catch (_) {
+      // The window could not change. The picture still shows.
+    }
+  }
+
+  Future<void> _enterFullscreen() async {
+    await _systemFullscreen(true);
+    if (!mounted) return;
+    await Navigator.of(context, rootNavigator: true).push(
+      MaterialPageRoute<void>(
+        fullscreenDialog: true,
+        builder: (_) => _FullscreenPage(
+          remote: widget.remote,
+          peerPlatform: widget.peerPlatform,
+          peerName: widget.peerName,
+        ),
+      ),
+    );
+    await _systemFullscreen(false);
+  }
+
+  Future<void> _rotate() async {
+    _landscape = !_landscape;
+    _rotated = true;
+    await SystemChrome.setPreferredOrientations(
+      _landscape
+          ? const [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
+          : const [DeviceOrientation.portraitUp],
+    );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _screenshot() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final link = AppScope.linkOf(context);
+    final bytes = widget.remote.frame.value;
+    void say(String text) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(text)));
+    }
+
+    if (bytes == null) {
+      say(widget.remote.codec == 'h264'
+          ? 'Screenshots work in simple video mode.'
+          : 'There is no picture to save yet.');
+      return;
+    }
+    try {
+      final folder = await link.hub.folderPath();
+      final name = 'Zephlink-screen-${DateTime.now().millisecondsSinceEpoch}.jpg';
+      await File('$folder${Platform.pathSeparator}$name')
+          .writeAsBytes(bytes, flush: true);
+      say('Saved $name in your Zephlink folder.');
+    } catch (_) {
+      say('Could not save the screenshot.');
+    }
+  }
+
+  void _quickSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          child: QuickActionsCard(
+            remote: widget.remote,
+            peerPlatform: widget.peerPlatform,
+            peerName: widget.peerName,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Shown on the picture area: fits inside the space, never scrolls.
+  Widget _stage() {
+    final picture = Center(child: _picture());
+    if (widget.remote.peerControl) return picture;
+    // View only: pinch or scroll to zoom in.
+    return InteractiveViewer(minScale: 1, maxScale: 6, child: picture);
+  }
+
+  List<Widget> _tools({required bool inFullscreen}) {
+    final remote = widget.remote;
+    return <Widget>[
+      IconButton(
+        tooltip: 'Save a screenshot',
+        onPressed: _screenshot,
+        icon: const Icon(Icons.photo_camera_outlined),
+      ),
+      if (Platform.isAndroid)
+        IconButton(
+          tooltip: _landscape ? 'Portrait' : 'Landscape',
+          onPressed: _rotate,
+          icon: Icon(_landscape
+              ? Icons.stay_current_portrait_rounded
+              : Icons.stay_current_landscape_rounded),
+        ),
+      if (remote.peerControl)
+        IconButton(
+          tooltip: 'Quick actions',
+          onPressed: _quickSheet,
+          icon: const Icon(Icons.bolt_rounded),
+        ),
+      if (inFullscreen)
+        IconButton(
+          tooltip: 'Exit full screen',
+          onPressed: () => Navigator.of(context).maybePop(),
+          icon: const Icon(Icons.fullscreen_exit_rounded),
+        )
+      else
+        IconButton(
+          tooltip: 'Full screen',
+          onPressed: _enterFullscreen,
+          icon: const Icon(Icons.fullscreen_rounded),
+        ),
+    ];
+  }
+
+  Widget _fullscreenBody() {
+    final remote = widget.remote;
+    final nav = remote.peerControl && _peerIsAndroid && !_hideBar;
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: ColoredBox(color: Colors.black, child: _stage()),
+        ),
+        Positioned(
+          top: 6,
+          right: 6,
+          child: SafeArea(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.45),
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: IconTheme(
+                data: const IconThemeData(color: Colors.white),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (!_hideBar) ..._tools(inFullscreen: true),
+                    IconButton(
+                      tooltip: _hideBar ? 'Show controls' : 'Hide controls',
+                      onPressed: () => setState(() => _hideBar = !_hideBar),
+                      icon: Icon(_hideBar
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        if (nav)
+          Positioned(
+            bottom: 8,
+            left: 0,
+            right: 0,
+            child: SafeArea(
+              child: Center(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.45),
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                  child: IconTheme(
+                    data: const IconThemeData(color: Colors.white),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          tooltip: 'Back',
+                          onPressed: () => remote
+                              .sendInput({'k': 'nav', 'a': 'back'}),
+                          icon: const Icon(Icons.arrow_back_rounded),
+                        ),
+                        IconButton(
+                          tooltip: 'Home',
+                          onPressed: () => remote
+                              .sendInput({'k': 'nav', 'a': 'home'}),
+                          icon: const Icon(Icons.circle_outlined),
+                        ),
+                        IconButton(
+                          tooltip: 'Recent apps',
+                          onPressed: () => remote
+                              .sendInput({'k': 'nav', 'a': 'recents'}),
+                          icon: const Icon(Icons.crop_square_rounded),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (widget.fullscreen) return _fullscreenBody();
     final remote = widget.remote;
     final tt = Theme.of(context).textTheme;
     return Align(
       alignment: Alignment.topCenter,
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 1100),
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    '${widget.peerName}\'s screen',
-                    style: tt.titleMedium,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '${widget.peerName}\'s screen',
+                      style: tt.titleMedium,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  ..._tools(inFullscreen: false),
+                  FilledButton.tonalIcon(
+                    onPressed: remote.stopViewing,
+                    icon: const Icon(Icons.close_rounded),
+                    label: const Text('Stop'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: ColoredBox(
+                    color: Colors.black,
+                    child: SizedBox.expand(child: _stage()),
                   ),
                 ),
-                FilledButton.tonalIcon(
-                  onPressed: remote.stopViewing,
-                  icon: const Icon(Icons.close_rounded),
-                  label: const Text('Stop'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(16),
-              child: ColoredBox(color: Colors.black, child: _picture()),
-            ),
-            _toolbar(context),
-          ],
+              ),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 230),
+                child: SingleChildScrollView(child: _toolbar(context)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The picture on its own page, using the whole window or screen.
+class _FullscreenPage extends StatelessWidget {
+  const _FullscreenPage({
+    required this.remote,
+    required this.peerPlatform,
+    required this.peerName,
+  });
+
+  final ScreenRemoteService remote;
+  final String peerPlatform;
+  final String peerName;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.escape): () =>
+              Navigator.of(context).maybePop(),
+        },
+        child: Focus(
+          autofocus: true,
+          child: ListenableBuilder(
+            listenable: remote,
+            builder: (context, _) {
+              if (!remote.viewing) {
+                // Sharing ended: leave full screen.
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (context.mounted) Navigator.of(context).maybePop();
+                });
+              }
+              return _ViewerPage(
+                remote: remote,
+                peerPlatform: peerPlatform,
+                peerName: peerName,
+                fullscreen: true,
+              );
+            },
+          ),
         ),
       ),
     );

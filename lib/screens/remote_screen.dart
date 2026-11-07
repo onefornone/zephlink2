@@ -1,7 +1,13 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../app_scope.dart';
 import '../features/screen_remote.dart';
+import '../widgets/find_phone.dart';
+import '../widgets/quick_actions.dart';
 import '../widgets/widgets.dart';
 import 'devices_screen.dart';
 
@@ -71,6 +77,8 @@ class RemoteScreen extends StatelessWidget {
         if (peer.platform != 'windows') {
           return page([
             if (noteCard != null) noteCard,
+            if (peer.platform == 'android')
+              FindPhoneCard(tools: link.tools, peerName: peer.name),
             ZCard(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -102,14 +110,33 @@ class RemoteScreen extends StatelessWidget {
                 children: [
                   const CardHeader('Control your phone from here'),
                   Text(
-                    'Open the Screen tab, see the phone screen, and ask the '
-                    'phone to allow control. Then click and drag on the '
-                    'picture like a touch screen.',
+                    'Ask the phone to allow control. Then use the quick '
+                    'actions below, or open the Screen tab to see the phone '
+                    'and click and drag on the picture like a touch screen.',
                     style: tt.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
                   ),
+                  const SizedBox(height: 12),
+                  if (remote.peerControl)
+                    FilledButton.tonalIcon(
+                      onPressed: remote.releaseControl,
+                      icon: const Icon(Icons.block_rounded),
+                      label: const Text('Stop controlling the phone'),
+                    )
+                  else
+                    FilledButton.icon(
+                      onPressed: remote.requestControl,
+                      icon: const Icon(Icons.touch_app_rounded),
+                      label: Text('Ask to control ${peer.name}'),
+                    ),
                 ],
               ),
             ),
+            if (remote.peerControl)
+              QuickActionsCard(
+                remote: remote,
+                peerPlatform: peer.platform,
+                peerName: peer.name,
+              ),
           ]);
         }
 
@@ -142,6 +169,11 @@ class RemoteScreen extends StatelessWidget {
         return page([
           if (noteCard != null) noteCard,
           _RemotePad(remote: remote, peerName: peer.name),
+          QuickActionsCard(
+            remote: remote,
+            peerPlatform: peer.platform,
+            peerName: peer.name,
+          ),
         ]);
       },
     );
@@ -167,13 +199,80 @@ class _RemotePadState extends State<_RemotePad> {
   DateTime _lastMove = DateTime.fromMillisecondsSinceEpoch(0);
   double _scrollCarry = 0;
 
+  // Touchpad finger tracking (raw touches, so the page never scrolls).
+  final Map<int, Offset> _fingers = {};
+  Offset _padStart = Offset.zero;
+  DateTime _padDownAt = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _padMoved = false;
+  bool _padScrolled = false;
+  bool _holdFired = false;
+  int _mostFingers = 0;
+  Timer? _holdTimer;
+
   @override
   void dispose() {
+    _holdTimer?.cancel();
     _text.dispose();
     super.dispose();
   }
 
   void _send(Map<String, dynamic> input) => widget.remote.sendInput(input);
+
+  void _padDown(PointerDownEvent event) {
+    _fingers[event.pointer] = event.position;
+    _mostFingers = math.max(_mostFingers, _fingers.length);
+    if (_fingers.length == 1) {
+      _padStart = event.position;
+      _padDownAt = DateTime.now();
+      _padMoved = false;
+      _padScrolled = false;
+      _holdFired = false;
+      _mostFingers = 1;
+      _holdTimer?.cancel();
+      _holdTimer = Timer(const Duration(milliseconds: 550), () {
+        if (!_padMoved && _fingers.length == 1) {
+          _holdFired = true;
+          _send(<String, dynamic>{'k': 'click', 'b': 'r'});
+        }
+      });
+    } else {
+      _holdTimer?.cancel();
+    }
+  }
+
+  void _padMove(PointerMoveEvent event) {
+    if (!_fingers.containsKey(event.pointer)) return;
+    _fingers[event.pointer] = event.position;
+    if (_fingers.length >= 2) {
+      // Two fingers scroll.
+      _padScrolled = true;
+      _scroll(event.delta.dy / _fingers.length);
+      return;
+    }
+    if (!_padMoved && (event.position - _padStart).distance > 6) {
+      _padMoved = true;
+      _holdTimer?.cancel();
+    }
+    if (_padMoved) _move(event.delta);
+  }
+
+  void _padUp(PointerEvent event) {
+    _fingers.remove(event.pointer);
+    if (_fingers.isNotEmpty) return;
+    _holdTimer?.cancel();
+    final quick =
+        DateTime.now().difference(_padDownAt) < const Duration(milliseconds: 300);
+    if (_mostFingers >= 2) {
+      // A quick two-finger tap is a right click.
+      if (!_padScrolled && !_padMoved && quick) {
+        _send(<String, dynamic>{'k': 'click', 'b': 'r'});
+      }
+    } else if (!_padMoved && !_holdFired && quick) {
+      // Two quick taps in a row become a double click on the PC.
+      _send(<String, dynamic>{'k': 'click', 'b': 'l'});
+    }
+    _mostFingers = 0;
+  }
 
   void _tapKey(int vk) => _send(<String, dynamic>{'k': 'tap', 'vk': vk});
 
@@ -250,15 +349,11 @@ class _RemotePadState extends State<_RemotePad> {
                 child: Row(
                   children: [
                     Expanded(
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onPanUpdate: (details) => _move(details.delta),
-                        onTap: () =>
-                            _send(<String, dynamic>{'k': 'click', 'b': 'l'}),
-                        onDoubleTap: () =>
-                            _send(<String, dynamic>{'k': 'dbl'}),
-                        onLongPress: () =>
-                            _send(<String, dynamic>{'k': 'click', 'b': 'r'}),
+                      child: _Eager(
+                        onDown: _padDown,
+                        onMove: _padMove,
+                        onUp: _padUp,
+                        onCancel: _padUp,
                         child: Container(
                           decoration: BoxDecoration(
                             color: cs.surfaceContainerHighest,
@@ -266,7 +361,8 @@ class _RemotePadState extends State<_RemotePad> {
                           ),
                           alignment: Alignment.center,
                           child: Text(
-                            'Drag to move\nTap to click, hold to right-click',
+                            'Drag to move. Tap to click.\n'
+                            'Hold for right-click. Two fingers to scroll.',
                             textAlign: TextAlign.center,
                             style: tt.bodySmall
                                 ?.copyWith(color: cs.onSurfaceVariant),
@@ -275,10 +371,8 @@ class _RemotePadState extends State<_RemotePad> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onVerticalDragUpdate: (details) =>
-                          _scroll(details.delta.dy),
+                    _Eager(
+                      onMove: (event) => _scroll(event.delta.dy),
                       child: Container(
                         width: 44,
                         decoration: BoxDecoration(
@@ -421,6 +515,46 @@ class _RemotePadState extends State<_RemotePad> {
           ),
         ),
       ]),
+    );
+  }
+}
+
+/// Takes every touch for itself, so a scrolling page around it cannot steal
+/// the finger half way through a drag.
+class _Eager extends StatelessWidget {
+  const _Eager({
+    required this.child,
+    this.onDown,
+    this.onMove,
+    this.onUp,
+    this.onCancel,
+  });
+
+  final Widget child;
+  final void Function(PointerDownEvent event)? onDown;
+  final void Function(PointerMoveEvent event)? onMove;
+  final void Function(PointerUpEvent event)? onUp;
+  final void Function(PointerCancelEvent event)? onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    return RawGestureDetector(
+      behavior: HitTestBehavior.opaque,
+      gestures: <Type, GestureRecognizerFactory>{
+        EagerGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<EagerGestureRecognizer>(
+          EagerGestureRecognizer.new,
+          (EagerGestureRecognizer instance) {},
+        ),
+      },
+      child: Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: onDown,
+        onPointerMove: onMove,
+        onPointerUp: onUp,
+        onPointerCancel: onCancel,
+        child: child,
+      ),
     );
   }
 }

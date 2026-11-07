@@ -12,9 +12,11 @@ import '../platform/android_received_files.dart';
 import '../platform/android_file_picker.dart';
 import '../theme/zeph_colors.dart';
 import '../widgets/format.dart';
+import '../widgets/resend.dart';
 import '../widgets/transfer_preview.dart';
 import '../widgets/widgets.dart';
 import 'devices_screen.dart';
+import 'remote_files_screen.dart';
 
 /// Files tab: send files to the other device and see what is coming in.
 class FilesScreen extends StatelessWidget {
@@ -33,6 +35,7 @@ class FilesScreen extends StatelessWidget {
             padding: const EdgeInsets.all(16),
             children: gapped([
               _SendCard(link: link),
+              _BrowseCard(link: link),
               _TransfersCard(link: link),
               _FolderCard(link: link),
             ]),
@@ -213,6 +216,48 @@ class _SendCard extends StatelessWidget {
   }
 }
 
+class _BrowseCard extends StatelessWidget {
+  const _BrowseCard({required this.link});
+
+  final LinkController link;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final name = link.activePeer?.name ?? 'the other device';
+    return ZCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const CardHeader('Browse their files'),
+          Text(
+            link.connected
+                ? 'Look through the folders on $name and pick a file to '
+                    'receive here. $name is asked first, and nothing can be '
+                    'changed or deleted from here.'
+                : 'Connect a device first, then you can look through its '
+                    'folders and pick files to receive.',
+            style: tt.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
+          ),
+          const SizedBox(height: 12),
+          FilledButton.tonalIcon(
+            onPressed: link.connected
+                ? () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const RemoteFilesScreen(),
+                      ),
+                    )
+                : null,
+            icon: const Icon(Icons.folder_open_rounded),
+            label: Text('Browse files on $name'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _TransfersCard extends StatelessWidget {
   const _TransfersCard({required this.link});
 
@@ -255,9 +300,24 @@ class _TransfersCard extends StatelessWidget {
           CardHeader(
             'Transfers',
             trailing: hasFinished
-                ? TextButton(
-                    onPressed: link.clearFinishedTransfers,
-                    child: const Text('Clear finished'),
+                ? Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (items.any((item) =>
+                              item.outgoing &&
+                              (item.state == TransferState.failed ||
+                                  item.state == TransferState.cancelled)) &&
+                          link.activePeer != null)
+                        TextButton.icon(
+                          onPressed: link.resendAllFailed,
+                          icon: const Icon(Icons.replay_rounded, size: 18),
+                          label: const Text('Send failed again'),
+                        ),
+                      TextButton(
+                        onPressed: link.clearFinishedTransfers,
+                        child: const Text('Clear finished'),
+                      ),
+                    ],
                   )
                 : null,
           ),
@@ -334,7 +394,17 @@ class _TransfersCard extends StatelessWidget {
                         icon: const Icon(Icons.close_rounded),
                         onPressed: () => link.cancelTransfer(item),
                       ),
-                    ] else if (item.state == TransferState.done &&
+                    ] else if (item.outgoing &&
+                        (item.state == TransferState.failed ||
+                            item.state == TransferState.cancelled))
+                      IconButton(
+                        tooltip: 'Send again',
+                        icon: const Icon(Icons.replay_rounded),
+                        onPressed: link.activePeer == null
+                            ? null
+                            : () => resendWithMessage(context, link, item),
+                      )
+                    else if (item.state == TransferState.done &&
                         item.path != null)
                       IconButton(
                         tooltip: 'Open file',

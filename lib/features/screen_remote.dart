@@ -4,15 +4,22 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../link/models.dart';
 import '../link/secure_session.dart';
 import '../platform/android_screen.dart';
+import '../platform/h264_viewer.dart';
+import '../platform/windows_actions.dart';
 import '../platform/windows_native.dart';
 
 /// Picture frames travel as raw bytes starting with this number. File
 /// transfers use small numbers, so the two never mix.
 const int screenFrameId = 0xFFFFFF01;
+
+/// H.264 video pieces use this number. The first byte after it is 2 for a
+/// full picture and 3 for a change.
+const int screenVideoId = 0xFFFFFF02;
 
 /// How sharp and how fast the shared screen is.
 class ScreenQuality {
@@ -44,7 +51,32 @@ class ScreenRemoteService extends ChangeNotifier {
     required this.ask,
     required this.peerName,
     required this.peerPlatform,
-  });
+    SharedPreferences? prefs,
+  })  : _prefs = prefs,
+        alwaysAllowView = prefs?.getBool('zl_always_view') ?? false,
+        autoView = prefs?.getBool('zl_auto_view') ?? false;
+
+  final SharedPreferences? _prefs;
+
+  /// This device lets the linked device see its screen without asking each
+  /// time (view only, never control). On Android the system still shows its
+  /// own "Start now" box each time sharing begins.
+  bool alwaysAllowView;
+
+  /// Open the other device's screen by itself when the Screen tab is shown.
+  bool autoView;
+
+  Future<void> setAlwaysAllowView(bool value) async {
+    alwaysAllowView = value;
+    notifyListeners();
+    await _prefs?.setBool('zl_always_view', value);
+  }
+
+  Future<void> setAutoView(bool value) async {
+    autoView = value;
+    notifyListeners();
+    await _prefs?.setBool('zl_auto_view', value);
+  }
 
   final Future<ConsentAnswer> Function(ConsentRequest request) ask;
   final String Function() peerName;
@@ -79,6 +111,23 @@ class ScreenRemoteService extends ChangeNotifier {
   bool _peerControl = false;
   Timer? _askTimer;
 
+  // H.264 video.
+  bool preferH264 = true;
+  String _codec = 'jpeg';
+  H264Viewer? _video;
+  Timer? _videoTimer;
+  bool _needKey = false;
+
+  /// Apps on the phone we control (filled after [requestApps]).
+  List<Map<String, String>> peerApps = const [];
+
+  /// This build can play smooth H.264 video (Windows build only).
+  bool get canH264 => H264Viewer.available;
+
+  /// "h264" or "jpeg": how the picture we are watching is being sent.
+  String get codec => _codec;
+  H264Viewer? get video => _video;
+
   bool get connected => _session != null;
   bool get supportsSharing => Platform.isAndroid || Platform.isWindows;
 
@@ -106,6 +155,14 @@ class ScreenRemoteService extends ChangeNotifier {
     _messageSub = session.messages.listen(_onMessage);
     _binarySub = session.binary.listen(_onBinary);
     notifyListeners();
+    if (autoView) {
+      // Give the other device a moment to finish connecting, then look.
+      Timer(const Duration(seconds: 2), () {
+        if (identical(_session, session) && !_viewing && !_asked) {
+          unawaited(requestView());
+        }
+      });
+    }
   }
 
   void detach() {
@@ -115,14 +172,38 @@ class ScreenRemoteService extends ChangeNotifier {
     _binarySub = null;
     _stopSharingLocal();
     _askTimer?.cancel();
+    _disposeVideo();
     _viewing = false;
     _asked = false;
     _peerControl = false;
     _controlGranted = false;
     _controlFromShare = false;
+    peerApps = const [];
     frame.value = null;
     _session = null;
     notifyListeners();
+  }
+
+  void _disposeVideo() {
+    _videoTimer?.cancel();
+    _videoTimer = null;
+    final viewer = _video;
+    _video = null;
+    _codec = 'jpeg';
+    if (viewer != null) unawaited(viewer.dispose());
+  }
+
+  void setPreferH264(bool value) {
+    preferH264 = value;
+    notifyListeners();
+  }
+
+  /// Switches the video we are watching back to small pictures.
+  Future<void> useSimpleVideo({String? why}) async {
+    _disposeVideo();
+    if (why != null) notice = why;
+    notifyListeners();
+    await _send(<String, dynamic>{'t': 'scr-want', 'codec': 'jpeg'});
   }
 
   @override
@@ -200,6 +281,10 @@ class ScreenRemoteService extends ChangeNotifier {
         onStopped: () {
           if (_sharing) unawaited(stopSharing());
         },
+        onVideoFailed: () {
+          unawaited(AndroidScreen.setCodec('jpeg'));
+          unawaited(_send(<String, dynamic>{'t': 'scr-codec', 'codec': 'jpeg'}));
+        },
       );
       if (error == null) {
         _stopCapture = () => unawaited(AndroidScreen.stop());
@@ -220,14 +305,31 @@ class ScreenRemoteService extends ChangeNotifier {
     return 'This device cannot share its screen.';
   }
 
-  void _onCaptured(Uint8List jpeg) {
-    if (!_sharing || !_watched || _inFlight >= 2) return;
+  /// [data] is a JPEG picture (starts with 0xFF) or an H.264 piece (first
+  /// byte 2 = full picture, 3 = change).
+  void _onCaptured(Uint8List data) {
+    if (!_sharing || !_watched || data.isEmpty) return;
     final session = _session;
     if (session == null) return;
+    final jpeg = data[0] == 0xFF;
+    if (jpeg) {
+      if (_inFlight >= 2) return;
+    } else {
+      final key = data[0] == 2;
+      if (_needKey && !key) return;
+      if (_inFlight >= 10) {
+        // Dropping a piece breaks the video until the next full picture.
+        _needKey = true;
+        unawaited(AndroidScreen.requestKeyFrame());
+        return;
+      }
+      if (key) _needKey = false;
+    }
     _inFlight++;
-    final out = Uint8List(4 + jpeg.length);
-    ByteData.sublistView(out).setUint32(0, screenFrameId);
-    out.setRange(4, out.length, jpeg);
+    final out = Uint8List(4 + data.length);
+    ByteData.sublistView(out)
+        .setUint32(0, jpeg ? screenFrameId : screenVideoId);
+    out.setRange(4, out.length, data);
     unawaited(session.sendBytes(out));
   }
 
@@ -272,6 +374,7 @@ class ScreenRemoteService extends ChangeNotifier {
   Future<void> stopViewing() async {
     final wasOn = _viewing || _asked;
     _askTimer?.cancel();
+    _disposeVideo();
     _viewing = false;
     _asked = false;
     _peerControl = false;
@@ -329,6 +432,18 @@ class ScreenRemoteService extends ChangeNotifier {
         if (_sharing) {
           _watched = true;
           _inFlight = 0;
+          _needKey = false;
+          unawaited(_chooseCodec(m['codec']));
+        }
+      case 'scr-want':
+        if (_sharing) unawaited(_chooseCodec(m['codec']));
+      case 'scr-key':
+        if (_sharing) unawaited(AndroidScreen.requestKeyFrame());
+      case 'scr-codec':
+        if (m['codec'] == 'jpeg' && _codec != 'jpeg') {
+          _disposeVideo();
+          notice = 'Smooth video was not available, so simple video is used.';
+          notifyListeners();
         }
       case 'scr-ack':
         if (_inFlight > 0) _inFlight--;
@@ -347,6 +462,7 @@ class ScreenRemoteService extends ChangeNotifier {
         notifyListeners();
       case 'scr-stop':
         _askTimer?.cancel();
+        _disposeVideo();
         if (_viewing || _asked) {
           _viewing = false;
           _asked = false;
@@ -378,15 +494,68 @@ class ScreenRemoteService extends ChangeNotifier {
         if (changed) notifyListeners();
       case 'rc':
         _onInput(m);
+      case 'qc':
+        unawaited(_onQuick(m));
+      case 'qc-r':
+        final quickWhy = m['why'];
+        notice = m['ok'] == true
+            ? 'Done.'
+            : (quickWhy is String ? quickWhy : 'That did not work.');
+        notifyListeners();
+      case 'qc-apps':
+        unawaited(_onAppsRequested());
+      case 'qc-apps-r':
+        final raw = m['apps'];
+        if (raw is List) {
+          peerApps = <Map<String, String>>[
+            for (final item in raw)
+              if (item is Map && item['label'] is String && item['pkg'] is String)
+                <String, String>{
+                  'label': item['label'] as String,
+                  'pkg': item['pkg'] as String,
+                },
+          ];
+          notifyListeners();
+        }
+    }
+  }
+
+  /// Sharing side: use H.264 only when the viewer can play it and this
+  /// phone can make it. Otherwise tell the viewer to use pictures.
+  Future<void> _chooseCodec(Object? want) async {
+    if (want == 'h264') {
+      var ok = false;
+      if (Platform.isAndroid) ok = await AndroidScreen.setCodec('h264');
+      if (!ok) {
+        await _send(<String, dynamic>{'t': 'scr-codec', 'codec': 'jpeg'});
+      }
+    } else if (Platform.isAndroid) {
+      await AndroidScreen.setCodec('jpeg');
     }
   }
 
   void _onBinary(Uint8List data) {
     if (data.length <= 4) return;
-    if (ByteData.sublistView(data).getUint32(0) != screenFrameId) return;
+    final id = ByteData.sublistView(data).getUint32(0);
     if (!_viewing) return;
-    frame.value = Uint8List.sublistView(data, 4);
-    unawaited(_send(<String, dynamic>{'t': 'scr-ack'}));
+    if (id == screenFrameId) {
+      frame.value = Uint8List.sublistView(data, 4);
+      unawaited(_send(<String, dynamic>{'t': 'scr-ack'}));
+    } else if (id == screenVideoId && data.length > 5) {
+      final viewer = _video;
+      if (viewer != null) {
+        viewer.add(Uint8List.sublistView(data, 5), data[4] == 2);
+        _videoTimer ??= Timer(const Duration(seconds: 8), () {
+          final current = _video;
+          if (_viewing && current != null && !current.hasPicture) {
+            unawaited(useSimpleVideo(
+              why: 'Smooth video did not start, so simple video is used.',
+            ));
+          }
+        });
+      }
+      unawaited(_send(<String, dynamic>{'t': 'scr-ack'}));
+    }
   }
 
   Future<void> _onViewRequested() async {
@@ -406,6 +575,13 @@ class ScreenRemoteService extends ChangeNotifier {
       return;
     }
     if (_starting) return;
+    if (alwaysAllowView) {
+      final error = await startSharing(allowControl: false);
+      if (error != null) {
+        await _send(<String, dynamic>{'t': 'scr-no', 'why': error});
+      }
+      return;
+    }
     final answer = await ask(
       ConsentRequest(
         title: 'Show your screen to ${peerName()}?',
@@ -449,12 +625,25 @@ class ScreenRemoteService extends ChangeNotifier {
       return;
     }
     _askTimer?.cancel();
+    var want = 'jpeg';
+    if (preferH264 && H264Viewer.available) {
+      final viewer = H264Viewer(
+        onNeedKeyFrame: () => unawaited(_send(<String, dynamic>{'t': 'scr-key'})),
+      );
+      if (await viewer.start()) {
+        _video = viewer;
+        want = 'h264';
+      } else {
+        await viewer.dispose();
+      }
+    }
+    _codec = want;
     _asked = false;
     _viewing = true;
     _peerControl = m['ctl'] == true;
     notice = null;
     notifyListeners();
-    await _send(<String, dynamic>{'t': 'scr-watch'});
+    await _send(<String, dynamic>{'t': 'scr-watch', 'codec': want});
   }
 
   Future<void> _onControlRequested() async {
@@ -507,6 +696,82 @@ class ScreenRemoteService extends ChangeNotifier {
     } else if (Platform.isAndroid) {
       unawaited(AndroidScreen.apply(Map<String, dynamic>.of(m)));
     }
+  }
+
+  // ---- Quick actions (lock, power, open an app, ...) -------------------------
+
+  /// Asks the other device to do a one-tap action such as "lock".
+  Future<void> sendQuick(String action, {String? argument}) async {
+    if (!_peerControl) return;
+    notice = null;
+    notifyListeners();
+    await _send(<String, dynamic>{
+      't': 'qc',
+      'a': action,
+      if (argument != null) 's': argument,
+    });
+  }
+
+  /// Asks the phone for the list of its apps.
+  Future<void> requestApps() async {
+    if (!_peerControl) return;
+    await _send(<String, dynamic>{'t': 'qc-apps'});
+  }
+
+  Future<void> _onQuick(Map<String, dynamic> m) async {
+    final action = m['a'];
+    final raw = m['s'];
+    if (action is! String || action.length > 32) return;
+    final argument = raw is String && raw.length <= 2000 ? raw : null;
+    Future<void> reply(String? error) => _send(<String, dynamic>{
+          't': 'qc-r',
+          'ok': error == null,
+          if (error != null) 'why': error,
+        });
+    if (!_controlGranted) {
+      await reply('Control is not allowed on that device.');
+      return;
+    }
+    String? error;
+    if (Platform.isWindows) {
+      if (WindowsActions.isPower(action)) {
+        final answer = await ask(
+          ConsentRequest(
+            title: 'Let ${peerName()} ${WindowsActions.label(action)} this PC?',
+            message: 'It happens in 30 seconds. Choose Deny to stop it. '
+                'You can also cancel from the phone.',
+            allowLabel: 'Allow',
+            platform: peerPlatform(),
+          ),
+        );
+        if (!answer.allow || !_controlGranted) {
+          await reply('The owner of the PC said no.');
+          return;
+        }
+      }
+      if (action == 'screenoff') {
+        _windowsInput ??= WindowsInput.tryCreate();
+        final input = _windowsInput;
+        if (input == null) {
+          error = 'Could not reach Windows.';
+        } else {
+          input.screenOff();
+        }
+      } else {
+        error = await WindowsActions.run(action, argument: argument);
+      }
+    } else if (Platform.isAndroid) {
+      error = await AndroidScreen.quick(action, argument: argument);
+    } else {
+      error = 'This device does not support that.';
+    }
+    await reply(error);
+  }
+
+  Future<void> _onAppsRequested() async {
+    if (!_controlGranted || !Platform.isAndroid) return;
+    final apps = await AndroidScreen.listApps();
+    await _send(<String, dynamic>{'t': 'qc-apps-r', 'apps': apps});
   }
 
   /// Handy for the screens: the aspect of the latest picture is read from

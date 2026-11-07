@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../app_scope.dart';
@@ -199,6 +201,21 @@ class _SettingsScreenState extends State<SettingsScreen>
                                 'Text you copy appears on the other device',
                             value: link.autoClipboard,
                             onChanged: link.setAutoClipboard,
+                          ),
+                          if (Platform.isAndroid)
+                            ToggleRow(
+                              title: 'Let my PC ring this phone',
+                              subtitle:
+                                  'Find my phone: rings loudly, even on silent, when a linked device asks',
+                              value: link.tools.allowRing,
+                              onChanged: link.tools.setAllowRing,
+                            ),
+                          ToggleRow(
+                            title: 'Let linked devices browse my files',
+                            subtitle:
+                                'Skip the question each time. They can only look and ask for a file, never change or delete',
+                            value: link.tools.alwaysAllowFiles,
+                            onChanged: link.tools.setAlwaysAllowFiles,
                           ),
                           if (BackgroundKeeper.supported ||
                               WindowsBackgroundHost.supported) ...[

@@ -8,6 +8,7 @@ import 'shell/adaptive_shell.dart';
 import 'theme/app_theme.dart';
 import 'theme/theme_controller.dart';
 import 'widgets/approval_host.dart';
+import 'widgets/find_phone.dart';
 
 /// Lets the link show questions on top of any screen.
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
@@ -40,7 +41,11 @@ class ZephlinkApp extends StatelessWidget {
                 child: ApprovalHost(
                   navigatorKey: appNavigatorKey,
                   link: linkController,
-                  child: child ?? const SizedBox.shrink(),
+                  child: FindHost(
+                    navigatorKey: appNavigatorKey,
+                    link: linkController,
+                    child: child ?? const SizedBox.shrink(),
+                  ),
                 ),
               ),
             ),
