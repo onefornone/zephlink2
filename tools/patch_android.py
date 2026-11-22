@@ -313,6 +313,15 @@ if 'key.properties' not in gradle:
 # It only raises, never lowers.
 # ---------------------------------------------------------------------------
 INIT = r'''allprojects {
+    // Android's release "lint vital" check crashes inside some plugins
+    // (a bug in the lint tool: NoSuchMethodError / removeLast). It only
+    // checks code style, never changes the app, so it is switched off.
+    tasks.configureEach { t ->
+        if (t.name.startsWith("lintVital") || t.name.startsWith("lintAnalyzeRelease")
+                || t.name.startsWith("lintReportRelease")) {
+            t.enabled = false
+        }
+    }
     afterEvaluate { p ->
         def ext = p.extensions.findByName("android")
         if (ext == null) return
@@ -339,4 +348,4 @@ apply_line = 'apply(from = "zephlink-compilesdk.gradle")'
 root_build = root_build.replace(apply_line, '').lstrip()
 with open(root_gradle, 'w', encoding='utf-8') as f:
     f.write(apply_line + '\n\n' + root_build + '\n')
-print('Project-scoped Android compileSdk override written.')
+print('Project-scoped Android compileSdk override and lint switch-off written.')
