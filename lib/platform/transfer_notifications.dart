@@ -46,6 +46,31 @@ class TransferNotifications {
     }
   }
 
+  /// A plain notice, such as an incoming call or text from the phone.
+  Future<void> notice(String title, String body) async {
+    if (!_ready) return;
+    const androidDetails = AndroidNotificationDetails(
+      'zephlink_phone',
+      'Phone texts and calls',
+      channelDescription: 'Shown when your phone gets a text or call',
+      importance: Importance.high,
+      priority: Priority.high,
+    );
+    try {
+      await _plugin.show(
+        id: DateTime.now().millisecondsSinceEpoch.remainder(0x7fffffff),
+        title: title,
+        body: body,
+        notificationDetails: const NotificationDetails(
+          android: androidDetails,
+          windows: WindowsNotificationDetails(),
+        ),
+      );
+    } catch (_) {
+      // A missed notice is not worth an error.
+    }
+  }
+
   Future<void> receivedFile(String name, String from) async {
     if (!_ready) return;
     const androidDetails = AndroidNotificationDetails(

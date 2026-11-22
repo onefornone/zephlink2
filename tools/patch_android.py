@@ -22,6 +22,14 @@ PERMISSIONS = [
     'SYSTEM_ALERT_WINDOW',
     'MANAGE_EXTERNAL_STORAGE',
     'READ_EXTERNAL_STORAGE',
+    'READ_SMS',
+    'SEND_SMS',
+    'RECEIVE_SMS',
+    'READ_PHONE_STATE',
+    'READ_CALL_LOG',
+    'ANSWER_PHONE_CALLS',
+    'READ_CONTACTS',
+    'REQUEST_INSTALL_PACKAGES',
 ]
 
 # Find the app's code folder and package name that flutter create made.
@@ -42,6 +50,8 @@ for name in (
     'ScreenCaptureService.kt',
     'RemoteControlService.kt',
     'ToolsBridge.kt',
+    'PhoneBridge.kt',
+    'FileOpener.kt',
 ):
     text = open(os.path.join('platform/android', name), encoding='utf-8').read()
     text = re.sub(r'^package\s+[\w.]+', 'package ' + package, text, count=1, flags=re.M)
@@ -57,6 +67,12 @@ perms = ''.join(
 )
 if perms:
     s = s.replace('<application', perms + '    <application', 1)
+if 'android.hardware.telephony' not in s:
+    s = s.replace(
+        '<application',
+        '    <uses-feature android:name="android.hardware.telephony" android:required="false"/>\n    <application',
+        1,
+    )
 if 'android.intent.category.LAUNCHER' not in s.split('<application')[0]:
     queries = (
         '    <queries>\n'
@@ -67,6 +83,20 @@ if 'android.intent.category.LAUNCHER' not in s.split('<application')[0]:
         '    </queries>\n'
     )
     s = s.replace('<application', queries + '    <application', 1)
+if 'vnd.android.document/directory' not in s:
+    file_queries = (
+        '    <queries>\n'
+        '        <intent>\n'
+        '            <action android:name="android.intent.action.VIEW" />\n'
+        '            <data android:mimeType="vnd.android.document/directory" />\n'
+        '        </intent>\n'
+        '        <intent>\n'
+        '            <action android:name="android.intent.action.VIEW" />\n'
+        '            <data android:mimeType="*/*" />\n'
+        '        </intent>\n'
+        '    </queries>\n'
+    )
+    s = s.replace('<application', file_queries + '    <application', 1)
 service = (
     '        <service android:name="%s.KeepAliveService" android:exported="false"\n'
     '            android:foregroundServiceType="connectedDevice"/>\n' % package

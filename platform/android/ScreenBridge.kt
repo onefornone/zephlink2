@@ -33,6 +33,7 @@ object ScreenBridge {
 
     fun register(host: Activity, messenger: BinaryMessenger) {
         ToolsBridge.register(host, messenger)
+        PhoneBridge.register(host, messenger)
         MethodChannel(messenger, "zephlink/screen").setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {

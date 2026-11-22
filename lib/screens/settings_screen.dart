@@ -6,6 +6,7 @@ import '../app_scope.dart';
 import '../platform/android_notification_forwarder.dart';
 import '../platform/background.dart';
 import '../platform/windows_background_host.dart';
+import '../widgets/internet_link_card.dart';
 import '../widgets/widgets.dart';
 import 'devices_screen.dart';
 
@@ -210,6 +211,22 @@ class _SettingsScreenState extends State<SettingsScreen>
                               value: link.tools.allowRing,
                               onChanged: link.tools.setAllowRing,
                             ),
+                          if (Platform.isAndroid)
+                            ToggleRow(
+                              title: 'Share my texts and calls with my PC',
+                              subtitle:
+                                  'Skip the question each time. The PC can read and send texts and answer or decline calls. Android still asks for its own permissions',
+                              value: link.phone.alwaysAllow,
+                              onChanged: link.phone.setAlwaysAllow,
+                            )
+                          else
+                            ToggleRow(
+                              title: 'Show phone texts and calls here',
+                              subtitle:
+                                  'Asks the phone for its texts and calls as soon as it links, and shows a pop-up when it rings',
+                              value: link.phone.autoOpen,
+                              onChanged: link.phone.setAutoOpen,
+                            ),
                           ToggleRow(
                             title: 'Let linked devices browse my files',
                             subtitle:
@@ -263,6 +280,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                       ),
                     );
                   },
+                ),
+                ListenableBuilder(
+                  listenable: link,
+                  builder: (context, _) => InternetLinkCard(link: link),
                 ),
                 ZCard(
                   child: Column(

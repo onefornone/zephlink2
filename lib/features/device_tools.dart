@@ -65,6 +65,7 @@ class DeviceToolsService extends ChangeNotifier {
     required this.ask,
     required this.peerName,
     required this.sendFile,
+    required this.sendFolder,
     SharedPreferences? prefs,
   })  : _prefs = prefs,
         allowRing = prefs?.getBool('zl_allow_ring') ?? true,
@@ -76,6 +77,9 @@ class DeviceToolsService extends ChangeNotifier {
 
   /// Sends one file from this device to the other (the normal transfer).
   final Future<void> Function(String path) sendFile;
+
+  /// Zips a folder on this device and sends it. Null when queued, else why not.
+  final Future<String?> Function(String path) sendFolder;
 
   /// Other devices may make this phone ring.
   bool allowRing;
@@ -451,6 +455,11 @@ class DeviceToolsService extends ChangeNotifier {
       return;
     }
     try {
+      if (await Directory(raw).exists()) {
+        final why = await sendFolder(raw);
+        if (why != null) await fail(why);
+        return;
+      }
       final file = File(raw);
       if (!await file.exists()) {
         await fail('That file no longer exists.');

@@ -28,6 +28,7 @@ class PairedPeer {
     required this.name,
     required this.platform,
     required this.publicKey,
+    this.relayKey,
   });
 
   final String id;
@@ -35,11 +36,17 @@ class PairedPeer {
   final String platform;
   final List<int> publicKey;
 
+  /// Secret shared by the two paired devices (never sent to the relay). The
+  /// internet meeting-room name is made from it, so only these two devices
+  /// can find the room.
+  String? relayKey;
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'name': name,
         'plat': platform,
         'key': b64(publicKey),
+        if (relayKey != null) 'rk': relayKey,
       };
 
   static PairedPeer? fromJson(Object? json) {
@@ -50,6 +57,7 @@ class PairedPeer {
         name: json['name'] as String,
         platform: (json['plat'] as String?) ?? 'other',
         publicKey: unb64(json['key']),
+        relayKey: json['rk'] is String ? json['rk'] as String : null,
       );
     } catch (_) {
       return null;

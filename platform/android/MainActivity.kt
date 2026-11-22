@@ -238,14 +238,14 @@ class MainActivity : FlutterActivity() {
                             runReceivedFilesTask(result) { createThumbnail(Uri.parse(uri)) }
                         }
                         "openFolder" -> {
-                            openReceivedFolder()
-                            result.success(true)
+                            result.success(FileOpener.openFolder(this))
                         }
                         "openFile" -> {
                             val uri = call.argument<String>("uri")
                                 ?: throw IllegalArgumentException("Missing received-file URI")
-                            openReceivedFile(Uri.parse(uri))
-                            result.success(true)
+                            FileOpener.openFile(this, Uri.parse(uri)) { reason ->
+                                result.success(reason)
+                            }
                         }
                         else -> result.notImplemented()
                     }
@@ -257,6 +257,15 @@ class MainActivity : FlutterActivity() {
                     )
                 }
             }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        PhoneBridge.handlePermissionResult(requestCode, grantResults)
     }
 
     @Deprecated("Deprecated in Android")
@@ -678,35 +687,6 @@ class MainActivity : FlutterActivity() {
         } finally {
             bitmap.recycle()
         }
-    }
-
-    private fun openReceivedFolder() {
-        val documentUri = DocumentsContract.buildDocumentUri(
-            "com.android.externalstorage.documents",
-            "primary:Download/Zephlink"
-        )
-        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(documentUri, "vnd.android.document/directory")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        if (packageManager.resolveActivity(viewIntent, 0) != null) {
-            startActivity(Intent.createChooser(viewIntent, "Open received files"))
-            return
-        }
-        val treeIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            treeIntent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, documentUri)
-        }
-        startActivity(treeIntent)
-    }
-
-    private fun openReceivedFile(uri: Uri) {
-        val mimeType = contentResolver.getType(uri) ?: "*/*"
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mimeType)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        startActivity(Intent.createChooser(intent, "Open received file"))
     }
 
     private fun uniqueFile(directory: File, name: String): File {

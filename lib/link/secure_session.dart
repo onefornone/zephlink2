@@ -152,6 +152,10 @@ class SecureSession {
   /// True when the other side said goodbye on purpose.
   bool byeReceived = false;
 
+  /// True when this link goes through the internet relay, not the Wi-Fi.
+  /// Messages are then kept under 1 MB, which the relay requires.
+  bool viaRelay = false;
+
   bool _started = false;
   final StreamController<Uint8List> _binary =
       StreamController<Uint8List>.broadcast();
@@ -178,7 +182,14 @@ class SecureSession {
     _inbox.attach(
       onData: (data) {
         _lastHeard = DateTime.now();
-        _recvChain = _recvChain.then((_) => _receive(data));
+        // Start opening at once (the helpers work in parallel) but hand the
+        // results on strictly in the order they arrived.
+        Future<OpenedFrame>? opening;
+        if (data is List<int>) {
+          opening = _worker.open(data);
+          opening.ignore();
+        }
+        _recvChain = _recvChain.then((_) => _receive(data, opening));
       },
       onClosed: _finish,
     );
@@ -192,17 +203,22 @@ class SecureSession {
   Future<void> sendBytes(List<int> data) => _enqueue(2, data);
 
   Future<void> _enqueue(int kind, List<int> payload) {
-    _sendChain = _sendChain.then((_) => _sendNow(kind, payload));
+    if (_closed) return _sendChain;
+    // Sealing starts right away (and in parallel for big files); the sealed
+    // frames still go out strictly in the order they were queued.
+    final sealed = _worker.seal(kind, payload);
+    sealed.ignore();
+    _sendChain = _sendChain.then((_) => _sendNow(sealed));
     return _sendChain;
   }
 
   /// Every sealed frame holds: 8 bytes message number, 1 byte kind
   /// (1 = text message, 2 = raw bytes), then the content. Sealing is done by
   /// the worker, away from the screen, so big files never freeze the app.
-  Future<void> _sendNow(int kind, List<int> payload) async {
+  Future<void> _sendNow(Future<Uint8List> sealed) async {
     if (_closed) return;
     try {
-      final frame = await _worker.seal(kind, payload);
+      final frame = await sealed;
       if (_closed) return;
       _ws.add(frame);
     } catch (_) {
@@ -210,11 +226,13 @@ class SecureSession {
     }
   }
 
-  Future<void> _receive(dynamic data) async {
+  Future<void> _receive(dynamic data, Future<OpenedFrame>? opening) async {
     if (_closed) return;
     try {
-      if (data is! List<int>) throw const FormatException('Unexpected text');
-      final opened = await _worker.open(data);
+      if (data is! List<int> || opening == null) {
+        throw const FormatException('Unexpected text');
+      }
+      final opened = await opening;
       if (_closed) return;
       if (opened.kind == 1) {
         final decoded = jsonDecode(utf8.decode(opened.payload));
@@ -539,15 +557,21 @@ Future<LinkResult> dialPeer({
   required Identity me,
   required String myName,
   required PeerStore store,
-  required InternetAddress address,
-  required int port,
+  InternetAddress? address,
+  int? port,
   required String mode,
   String? pin,
+
+  /// An already open connection (through the internet relay). When null, we
+  /// connect to [address] and [port] ourselves.
+  WebSocket? socket,
 }) async {
-  WebSocket? ws;
+  WebSocket? ws = socket;
   try {
-    ws = await WebSocket.connect('ws://${address.address}:$port$linkPath')
-        .timeout(const Duration(seconds: 5));
+    ws ??= await WebSocket.connect(
+      'ws://${address!.address}:$port$linkPath',
+      compression: CompressionOptions.compressionOff,
+    ).timeout(const Duration(seconds: 5));
     ws.pingInterval = const Duration(seconds: 20);
     final inbox = Inbox(ws);
 
@@ -656,11 +680,15 @@ Future<LinkResult> acceptPeer({
   required PeerStore store,
   required PairingWindow? Function() pairing,
   bool Function()? allowApprove,
+
+  /// How long to wait for the other device to start. Long when we are waiting
+  /// on the internet relay for it to come online.
+  Duration firstFrameTimeout = const Duration(seconds: 8),
 }) async {
   ws.pingInterval = const Duration(seconds: 20);
   final inbox = Inbox(ws);
   try {
-    final first = await inbox.next(timeout: const Duration(seconds: 8));
+    final first = await inbox.next(timeout: firstFrameTimeout);
     final commit = _parseCommit(first);
     final eph = await X25519().newKeyPair();
     final ephPub = (await eph.extractPublicKey()).bytes;
@@ -816,7 +844,10 @@ class LinkServer {
         try {
           if (request.uri.path == linkPath &&
               WebSocketTransformer.isUpgradeRequest(request)) {
-            final socket = await WebSocketTransformer.upgrade(request);
+            final socket = await WebSocketTransformer.upgrade(
+              request,
+              compression: CompressionOptions.compressionOff,
+            );
             onSocket(socket);
           } else if (info != null &&
               request.method == 'GET' &&

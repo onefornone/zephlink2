@@ -123,6 +123,24 @@ class _SendCard extends StatelessWidget {
         }
         return;
       }
+      if (sources.length >= 8) {
+        // Lots of small files are much quicker as one zip.
+        final first = sources.first.relativePath;
+        final rootName = first == null ? 'Folder' : first.split('/').first;
+        if (context.mounted) {
+          ScaffoldMessenger.of(context)
+            ..hideCurrentSnackBar()
+            ..showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Packing ${sources.length} files into one zip to send faster…',
+                ),
+              ),
+            );
+        }
+        final why = await link.sendSourcesAsZip(sources, rootName);
+        if (why == null) return;
+      }
       await link.sendSources(sources);
     } catch (error, stackTrace) {
       FlutterError.reportError(
@@ -268,12 +286,18 @@ class _TransfersCard extends StatelessWidget {
       case TransferState.waiting:
         return 'Waiting for the other device…';
       case TransferState.active:
-        return '${formatBytes(item.bytes)} of ${formatBytes(item.size)}'
-            ' · ${formatSpeed(item.speed)}';
+        return transferProgressText(
+          item.bytes,
+          item.size,
+          item.liveSpeed > 0 ? item.liveSpeed : item.speed,
+          item.remaining,
+        );
       case TransferState.paused:
         return item.error ?? 'Paused. Reconnect and resume to continue.';
       case TransferState.done:
-        return '${formatBytes(item.size)} · ${item.outgoing ? 'sent' : 'received'}';
+        final average = item.speed;
+        return '${formatBytes(item.size)} · ${item.outgoing ? 'sent' : 'received'}'
+            '${average >= 1 && item.size > 1024 * 1024 ? ' · ${formatSpeed(average)} on average' : ''}';
       case TransferState.failed:
         return item.error ?? 'Failed';
       case TransferState.cancelled:
@@ -410,7 +434,7 @@ class _TransfersCard extends StatelessWidget {
                         tooltip: 'Open file',
                         icon:
                             Icon(Icons.open_in_new_rounded, color: cs.success),
-                        onPressed: () => _openReceivedFile(context, item),
+                        onPressed: () => openReceivedFile(context, item),
                       ),
                   ],
                 ),
@@ -478,7 +502,10 @@ class _FolderCard extends StatelessWidget {
 
 Future<void> _openAndroidFolder(BuildContext context) async {
   try {
-    await AndroidReceivedFiles.openFolder();
+    final why = await AndroidReceivedFiles.openFolder();
+    if (why != null && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(why)));
+    }
   } catch (error, stackTrace) {
     FlutterError.reportError(
       FlutterErrorDetails(
@@ -497,14 +524,23 @@ Future<void> _openAndroidFolder(BuildContext context) async {
   }
 }
 
-Future<void> _openReceivedFile(
+/// Opens a received file. On Android an app (.apk) goes to the installer.
+Future<void> openReceivedFile(
   BuildContext context,
   TransferItem item,
 ) async {
   try {
     final uri = item.externalUri;
     if (uri != null && uri.startsWith('content://')) {
-      await AndroidReceivedFiles.openFile(uri);
+      final why = await AndroidReceivedFiles.openFile(uri);
+      if (why != null && context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(why),
+            duration: const Duration(seconds: 6),
+          ),
+        );
+      }
     } else {
       await OpenFilex.open(item.path!);
     }

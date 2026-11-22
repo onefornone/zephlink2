@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../features/device_tools.dart';
+import '../features/phone_service.dart';
 import '../features/screen_remote.dart';
 import '../features/transfer_hub.dart';
 import '../platform/android_notification_forwarder.dart';
@@ -18,6 +19,7 @@ import 'crypto_util.dart';
 import 'discovery.dart';
 import 'identity.dart';
 import 'models.dart';
+import 'relay.dart';
 import 'scanner.dart';
 import 'secure_session.dart';
 
@@ -28,6 +30,7 @@ class LinkController extends ChangeNotifier {
   LinkController(
     SharedPreferences prefs, {
     this.onFileReceived,
+    this.onNotice,
   })  : _prefs = prefs,
         _peers = PeerStore(prefs) {
     _name = prefs.getString('zl_name') ?? defaultDeviceName();
@@ -54,12 +57,24 @@ class LinkController extends ChangeNotifier {
       ask: askConsent,
       peerName: () => _active?.name ?? 'The other device',
       sendFile: (path) => hub.sendFiles([XFile(path)]),
+      sendFolder: hub.sendFolderAsZip,
       prefs: prefs,
     );
     tools.addListener(_notify);
+    phone = PhoneService(
+      ask: askConsent,
+      peerName: () => _active?.name ?? 'The other device',
+      peerPlatform: () => _active?.platform,
+      notice: (title, body) async => onNotice?.call(title, body),
+      prefs: prefs,
+    );
+    phone.addListener(_notify);
   }
 
   final Future<void> Function(TransferItem item, String from)? onFileReceived;
+
+  /// Shows a system notice (a text or call from the phone).
+  final Future<void> Function(String title, String body)? onNotice;
   final SharedPreferences _prefs;
   final PeerStore _peers;
 
@@ -72,6 +87,9 @@ class LinkController extends ChangeNotifier {
   /// Find my phone and browsing files on the other device.
   late final DeviceToolsService tools;
 
+  /// Texts and calls from the phone, shown on the PC.
+  late final PhoneService phone;
+
   late String _name;
   late bool _quickConnect;
   late bool _autoReceive;
@@ -79,6 +97,8 @@ class LinkController extends ChangeNotifier {
   late bool _keepRunning;
   late bool _fileNotifications;
   late bool _forwardNotifications;
+  String _relayUrl = '';
+  bool _relayOn = false;
 
   Identity? _identity;
   Discovery? _discovery;
@@ -89,6 +109,10 @@ class LinkController extends ChangeNotifier {
   Timer? _pingTimer;
   Timer? _clipTimer;
   Timer? _notificationTimer;
+  Timer? _relayTimer;
+  final Set<String> _relayBusy = {};
+  final Map<String, WebSocket> _relaySockets = {};
+  String? _relayNote;
 
   final Map<String, NearbyDevice> _nearby = {};
   final Map<String, DateTime> _firstSeen = {};
@@ -264,6 +288,12 @@ class LinkController extends ChangeNotifier {
     _discovery = discovery;
 
     await _loadAddresses();
+    _relayUrl = _prefs.getString('zl_relay_url') ?? '';
+    _relayOn = _prefs.getBool('zl_relay_on') ?? false;
+    _relayTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _relayTick(),
+    );
     _tickTimer = Timer.periodic(const Duration(seconds: 2), (_) => _tick());
     _pingTimer = Timer.periodic(const Duration(seconds: 5), (_) => _pingNow());
     if (_keepRunning && _peers.all.isNotEmpty) {
@@ -323,6 +353,8 @@ class LinkController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _tickTimer?.cancel();
+    _relayTimer?.cancel();
+    _closeRelaySockets();
     _pingTimer?.cancel();
     _clipTimer?.cancel();
     _notificationTimer?.cancel();
@@ -335,6 +367,8 @@ class LinkController extends ChangeNotifier {
     remote.dispose();
     tools.removeListener(_notify);
     tools.dispose();
+    phone.removeListener(_notify);
+    phone.dispose();
     _session?.close();
     super.dispose();
   }
@@ -369,6 +403,161 @@ class LinkController extends ChangeNotifier {
   Future<void> setAutoReceive(bool value) async {
     _autoReceive = value;
     await _prefs.setBool('zl_autoreceive', value);
+    _notify();
+  }
+
+  // ---- Internet link (through your own relay) -----------------------------
+
+  String get relayUrl => _relayUrl;
+  bool get relayOn => _relayOn;
+
+  /// What the internet link is doing right now, in plain words.
+  String? get relayNote => _relayNote;
+
+  /// True when the current link goes through the internet relay.
+  bool get viaRelay => _session?.viaRelay ?? false;
+
+  /// Paired devices that can already be reached over the internet.
+  List<PairedPeer> get relayReadyPeers =>
+      _peers.all.where((peer) => peer.relayKey != null).toList();
+
+  Future<void> setRelayOn(bool value) async {
+    _relayOn = value;
+    await _prefs.setBool('zl_relay_on', value);
+    if (!value) {
+      _closeRelaySockets();
+      _relayNote = null;
+    } else {
+      unawaited(_relayTick());
+    }
+    _notify();
+  }
+
+  /// Saves the relay address. Returns an error message, or null when saved.
+  Future<String?> setRelayUrl(String raw) async {
+    if (raw.trim().isEmpty) {
+      _relayUrl = '';
+      await _prefs.remove('zl_relay_url');
+      _closeRelaySockets();
+      _notify();
+      return null;
+    }
+    final cleaned = cleanRelayUrl(raw);
+    if (cleaned == null) {
+      return 'That does not look like a web address, such as '
+          'zephlink-relay.yourname.workers.dev';
+    }
+    _relayUrl = cleaned;
+    await _prefs.setString('zl_relay_url', cleaned);
+    _closeRelaySockets();
+    _notify();
+    if (_relayOn) unawaited(_relayTick());
+    return null;
+  }
+
+  void _closeRelaySockets() {
+    for (final socket in _relaySockets.values.toList()) {
+      try {
+        unawaited(socket.close());
+      } catch (_) {
+        // Already closed.
+      }
+    }
+    _relaySockets.clear();
+  }
+
+  /// Every 15 seconds: if a paired device is not on this Wi-Fi and we are not
+  /// linked to anything, try to meet it through the relay.
+  Future<void> _relayTick() async {
+    final me = _identity;
+    if (me == null || !_relayOn || _relayUrl.isEmpty || _disposed) return;
+    if (_hold || _session != null || _connecting || _request != null) {
+      return;
+    }
+    for (final peer in _peers.all) {
+      final key = peer.relayKey;
+      if (key == null) continue;
+      if (_nearby.containsKey(peer.id)) continue; // Same Wi-Fi: normal path.
+      if (_relayBusy.contains(peer.id)) continue;
+      unawaited(_relayConnect(me, peer, key));
+      return;
+    }
+  }
+
+  Future<void> _relayConnect(Identity me, PairedPeer peer, String key) async {
+    _relayBusy.add(peer.id);
+    final dial = me.id.compareTo(peer.id) < 0;
+    WebSocket? socket;
+    try {
+      final room = await relayRoomId(me.id, peer.id, key);
+      socket = await connectRelay(_relayUrl, room, dial: dial);
+      _relaySockets[peer.id] = socket;
+      _relayNote = dial
+          ? 'Linking to ${peer.name} over the internet…'
+          : 'Waiting for ${peer.name} over the internet…';
+      _notify();
+      if (dial) {
+        final result = await dialPeer(
+          me: me,
+          myName: _name,
+          store: _peers,
+          mode: 'link',
+          socket: socket,
+        );
+        result.session.viaRelay = true;
+        await _adopt(result);
+      } else {
+        await _onSocket(socket, viaRelay: true);
+        if (_session == null) _relayNote = null;
+      }
+    } catch (_) {
+      // The other device is not there yet, or the relay is unreachable. The
+      // next round tries again.
+      _relayNote = dial
+          ? '${peer.name} is not online over the internet right now.'
+          : 'Could not reach the relay.';
+      try {
+        await socket?.close();
+      } catch (_) {
+        // Already closed.
+      }
+    } finally {
+      _relaySockets.remove(peer.id);
+      _relayBusy.remove(peer.id);
+      if (_session != null) _relayNote = null;
+      if (!_disposed) _notify();
+    }
+  }
+
+  /// Shares the secret for the internet meeting room with a device we are now
+  /// linked to. The device that opened the connection picks it; both keep it.
+  Future<void> _shareRelayKey(PairedPeer peer, SecureSession session) async {
+    final me = _identity;
+    if (me == null || session.initiatorId != me.id) return;
+    final stored = _peers.byId(peer.id);
+    if (stored == null) return;
+    var key = stored.relayKey;
+    if (key == null) {
+      key = b64(randomBytes(32));
+      stored.relayKey = key;
+      await _peers.put(stored);
+      _notify();
+    }
+    await session.send(<String, dynamic>{'t': 'relay-key', 'k': key});
+  }
+
+  void _onRelayKey(Object? value) {
+    final active = _active;
+    if (active == null || value is! String) return;
+    try {
+      if (unb64(value).length != 32) return;
+    } catch (_) {
+      return;
+    }
+    final stored = _peers.byId(active.id);
+    if (stored == null || stored.relayKey == value) return;
+    stored.relayKey = value;
+    unawaited(_peers.put(stored));
     _notify();
   }
 
@@ -635,7 +824,7 @@ class LinkController extends ChangeNotifier {
     }
   }
 
-  Future<void> _onSocket(WebSocket socket) async {
+  Future<void> _onSocket(WebSocket socket, {bool viaRelay = false}) async {
     final me = _identity;
     if (me == null) {
       await socket.close();
@@ -648,8 +837,12 @@ class LinkController extends ChangeNotifier {
         me: me,
         myName: _name,
         store: _peers,
-        pairing: () => _pairing,
+        // Through the relay only already paired devices may come in.
+        pairing: () => viaRelay ? null : _pairing,
+        firstFrameTimeout:
+            viaRelay ? const Duration(hours: 12) : const Duration(seconds: 8),
         allowApprove: () {
+          if (viaRelay) return false;
           // One approval request at a time, and a short pause after a refusal
           // so nobody on the Wi-Fi can bury the screen in pop-ups.
           if (_approveBusy || _request != null) return false;
@@ -659,6 +852,7 @@ class LinkController extends ChangeNotifier {
           return true;
         },
       );
+      if (viaRelay) result.session.viaRelay = true;
       if (result.requiresApproval) {
         final ok = await _confirmPairing(result, incoming: true);
         if (!ok) {
@@ -778,6 +972,7 @@ class LinkController extends ChangeNotifier {
     hub.attach(session);
     remote.attach(session);
     tools.attach(session);
+    phone.attach(session);
     unawaited(_messageSub?.cancel());
     _messageSub = session.messages.listen(_onMessage);
     session.start();
@@ -796,7 +991,17 @@ class LinkController extends ChangeNotifier {
       }
     }
     await _peers.setLast(peer.id);
-    _log('Linked with ${peer.name}', 'link');
+    // The relay connection we just used stays open (it carries this link);
+    // any other waiting ones are closed.
+    _relaySockets.remove(peer.id);
+    _closeRelaySockets();
+    unawaited(_shareRelayKey(peer, session));
+    _log(
+      session.viaRelay
+          ? 'Linked with ${peer.name} over the internet'
+          : 'Linked with ${peer.name}',
+      'link',
+    );
     _startClipTimer();
     _startNotificationForwarding();
     unawaited(_pingNow());
@@ -863,6 +1068,7 @@ class LinkController extends ChangeNotifier {
     hub.detach();
     remote.detach();
     tools.detach();
+    phone.detach();
     unawaited(_messageSub?.cancel());
     _messageSub = null;
     _clipTimer?.cancel();
@@ -893,6 +1099,15 @@ class LinkController extends ChangeNotifier {
   Future<void> sendSources(List<TransferSource> sources) async {
     if (_session == null || sources.isEmpty) return;
     await hub.sendSources(sources);
+  }
+
+  /// One zip instead of many small files. Null when queued, else a reason.
+  Future<String?> sendSourcesAsZip(
+    List<TransferSource> sources,
+    String zipName,
+  ) async {
+    if (_session == null) return 'Connect a device first.';
+    return hub.sendAsZip(sources, zipName);
   }
 
   void cancelTransfer(TransferItem item) => hub.cancel(item);
@@ -970,6 +1185,8 @@ class LinkController extends ChangeNotifier {
 
   void _onMessage(Map<String, dynamic> message) {
     switch (message['t']) {
+      case 'relay-key':
+        _onRelayKey(message['k']);
       case 'clip':
         final text = message['text'];
         if (text is! String || text.isEmpty || text.length > 1000000) return;

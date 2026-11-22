@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import '../link/hash_worker.dart';
 import '../link/secure_session.dart';
 import '../platform/android_file_picker.dart';
+import 'zip_pack.dart';
 
 enum TransferState { waiting, active, paused, done, failed, cancelled }
 
@@ -42,7 +43,43 @@ class TransferItem {
   final String? relativePath;
   String? externalUri;
 
-  int bytes = 0;
+  int _bytes = 0;
+  DateTime? _sampleAt;
+  int _sampleBytes = 0;
+
+  /// Recent speed in bytes per second (smoothed), 0 until known.
+  double liveSpeed = 0;
+
+  int get bytes => _bytes;
+
+  set bytes(int value) {
+    _bytes = value;
+    final now = DateTime.now();
+    final at = _sampleAt;
+    if (at == null) {
+      _sampleAt = now;
+      _sampleBytes = value;
+      return;
+    }
+    final ms = now.difference(at).inMilliseconds;
+    if (ms >= 700) {
+      final instant = math.max(0.0, (value - _sampleBytes) * 1000 / ms);
+      liveSpeed = liveSpeed == 0 ? instant : liveSpeed * 0.6 + instant * 0.4;
+      _sampleAt = now;
+      _sampleBytes = value;
+    }
+  }
+
+  /// Estimated time left, or null when it cannot be told yet.
+  Duration? get remaining {
+    if (state != TransferState.active || liveSpeed < 1 || size <= 0) {
+      return null;
+    }
+    final left = size - _bytes;
+    if (left <= 0) return Duration.zero;
+    return Duration(seconds: (left / liveSpeed).ceil());
+  }
+
   TransferState state = TransferState.waiting;
   String? error;
   final DateTime started = DateTime.now();
@@ -144,7 +181,13 @@ class TransferHub {
   StreamSubscription<Uint8List>? _binarySub;
   final Map<int, _Outgoing> _outgoing = {};
   final Map<int, _Incoming> _incoming = {};
-  Future<void> _queue = Future<void>.value();
+  // Up to three files go at the same time. Small files finish much sooner
+  // this way, because each one waits for "yes" from the other device while
+  // the others keep sending.
+  static const int _parallelFiles = 3;
+  final List<Future<void> Function()> _sendLine = [];
+  final Set<String> _deleteWhenDone = {};
+  int _sending = 0;
   int _nextId = 1;
   Timer? _throttle;
   Directory? _dir;
@@ -198,6 +241,94 @@ class TransferHub {
     await sendSources(files.map((file) => TransferSource(file: file)).toList());
   }
 
+  /// Packs [sources] into one zip file and sends that. Many small files go
+  /// much faster this way, because the other device is asked only once.
+  /// Gives back null when it was queued, or a short reason when it could not
+  /// be done (then send the files one by one instead).
+  Future<String?> sendAsZip(
+    List<TransferSource> sources,
+    String zipName,
+  ) async {
+    if (_session == null) return 'Connect a device first.';
+    if (sources.isEmpty) return 'There is nothing to send.';
+    try {
+      final temp = await getTemporaryDirectory();
+      final dir = Directory('${temp.path}${Platform.pathSeparator}zephlink-zips');
+      await dir.create(recursive: true);
+      await _sweepOldZips(dir);
+      final base = _safeName(zipName.toLowerCase().endsWith('.zip')
+          ? zipName.substring(0, zipName.length - 4)
+          : zipName);
+      final display = '$base.zip';
+      final path =
+          '${dir.path}${Platform.pathSeparator}${_newResumeKey()}-$display';
+      final inputs = <ZipInput>[
+        for (final source in sources)
+          ZipInput(
+            source.file.path,
+            _safeRelativePath(source.relativePath) ?? source.file.name,
+          ),
+      ];
+      final packed = await packZip(inputs, path);
+      if (!packed) {
+        return 'That folder is too big or has too many files for one zip.';
+      }
+      for (final source in sources) {
+        await _cleanupPickedFile(source.file);
+      }
+      _deleteWhenDone.add(path);
+      await sendSources([TransferSource(file: XFile(path, name: display))]);
+      return null;
+    } catch (_) {
+      return 'Could not pack the folder.';
+    }
+  }
+
+  /// Zips a whole folder on this device and sends it (used when the other
+  /// device picks a folder in "Browse files").
+  Future<String?> sendFolderAsZip(String folderPath) async {
+    final trimmed = folderPath.replaceAll(RegExp(r'[\\/]+$'), '');
+    final root = trimmed.split(RegExp(r'[\\/]')).where((p) => p.isNotEmpty).lastOrNull;
+    final sources = <TransferSource>[];
+    try {
+      await for (final entity in Directory(folderPath).list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (entity is! File) continue;
+        final relative = entity.path
+            .substring(trimmed.length + 1)
+            .replaceAll('\\', '/');
+        sources.add(
+          TransferSource(
+            file: XFile(entity.path),
+            relativePath: '${root ?? 'Folder'}/$relative',
+          ),
+        );
+        if (sources.length > 60000) break;
+      }
+    } catch (_) {
+      return 'That folder cannot be read.';
+    }
+    if (sources.isEmpty) return 'That folder has no files.';
+    return sendAsZip(sources, root ?? 'Folder');
+  }
+
+  Future<void> _sweepOldZips(Directory dir) async {
+    try {
+      final limit = DateTime.now().subtract(const Duration(days: 1));
+      await for (final entity in dir.list()) {
+        if (entity is! File) continue;
+        if (_deleteWhenDone.contains(entity.path)) continue;
+        if ((await entity.lastModified()).isBefore(limit)) {
+          await entity.delete();
+        }
+      }
+    } catch (_) {
+      // Old zips are cleaned up next time.
+    }
+  }
+
   Future<void> sendSources(List<TransferSource> sources) async {
     final session = _session;
     if (session == null || sources.isEmpty) return;
@@ -218,7 +349,7 @@ class TransferHub {
         );
         items.insert(0, item);
         _changed();
-        _queue = _queue.then((_) => _sendOne(session, item, file));
+        _enqueueSend(() => _sendOne(session, item, file));
       } catch (error, stackTrace) {
         FlutterError.reportError(
           FlutterErrorDetails(
@@ -229,6 +360,24 @@ class TransferHub {
           ),
         );
       }
+    }
+  }
+
+  void _enqueueSend(Future<void> Function() job) {
+    _sendLine.add(job);
+    _pumpSends();
+  }
+
+  void _pumpSends() {
+    while (_sending < _parallelFiles && _sendLine.isNotEmpty) {
+      final job = _sendLine.removeAt(0);
+      _sending++;
+      unawaited(
+        job().catchError((Object _) {}).whenComplete(() {
+          _sending--;
+          _pumpSends();
+        }),
+      );
     }
   }
 
@@ -281,7 +430,11 @@ class TransferHub {
           await hasher.add(chunk);
         }
       }
-      await for (final chunk in _fileChunks(file.openRead(offset))) {
+      // A few chunks are queued at once so the encryption helpers stay busy.
+      final queued = <Future<void>>[];
+      // Through the internet relay every message must stay under 1 MB.
+      final chunkSize = session.viaRelay ? 256 * 1024 : _chunkSize;
+      await for (final chunk in _fileChunks(file.openRead(offset), chunkSize)) {
         if (out.cancelled || session.isClosed) break;
         while (out.sent - out.acked > _window &&
             !out.cancelled &&
@@ -296,12 +449,14 @@ class TransferHub {
         frame.setRange(4, frame.length, chunk);
         // The checksum is worked out in a helper while the chunk is sent.
         final hashing = hasher.add(chunk);
-        await session.sendBytes(frame);
+        queued.add(session.sendBytes(frame));
+        if (queued.length >= 3) await queued.removeAt(0);
         await hashing;
         out.sent += chunk.length;
         item.bytes = out.sent;
         _changed();
       }
+      await Future.wait(queued);
 
       if (out.connectionLost || session.isClosed) {
         _pauseItem(item);
@@ -352,6 +507,13 @@ class TransferHub {
       // cleaned up when the list is cleared or the resend succeeds.
       if (item.state == TransferState.done) {
         await _cleanupPickedFile(file);
+        if (_deleteWhenDone.remove(file.path)) {
+          try {
+            await File(file.path).delete();
+          } catch (_) {
+            // Swept later.
+          }
+        }
       }
     }
   }
@@ -372,19 +534,22 @@ class TransferHub {
     }
   }
 
-  static Stream<Uint8List> _fileChunks(Stream<List<int>> source) async* {
-    var buffer = Uint8List(_chunkSize);
+  static Stream<Uint8List> _fileChunks(
+    Stream<List<int>> source, [
+    int chunkSize = _chunkSize,
+  ]) async* {
+    var buffer = Uint8List(chunkSize);
     var used = 0;
     await for (final part in source) {
       var offset = 0;
       while (offset < part.length) {
-        final count = math.min(_chunkSize - used, part.length - offset);
+        final count = math.min(chunkSize - used, part.length - offset);
         buffer.setRange(used, used + count, part, offset);
         used += count;
         offset += count;
-        if (used == _chunkSize) {
+        if (used == chunkSize) {
           yield buffer;
-          buffer = Uint8List(_chunkSize);
+          buffer = Uint8List(chunkSize);
           used = 0;
         }
       }
@@ -493,7 +658,7 @@ class TransferHub {
     item.error = null;
     item.finished = null;
     _changed();
-    _queue = _queue.then((_) => _sendOne(session, item, XFile(path)));
+    _enqueueSend(() => _sendOne(session, item, XFile(path)));
   }
 
   /// Sends a failed or cancelled file again as a new transfer. Returns null

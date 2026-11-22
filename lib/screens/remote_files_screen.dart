@@ -95,6 +95,22 @@ class _RemoteFilesScreenState extends State<RemoteFilesScreen> {
       );
   }
 
+  Future<void> _downloadFolder(RemoteListing listing) async {
+    final link = AppScope.linkOf(context);
+    await link.tools.download(listing.path);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            'Asked ${link.activePeer?.name ?? 'the other device'} to zip and '
+            'send this folder. It will show up in Files.',
+          ),
+        ),
+      );
+  }
+
   @override
   Widget build(BuildContext context) {
     final link = AppScope.linkOf(context);
@@ -132,6 +148,12 @@ class _RemoteFilesScreenState extends State<RemoteFilesScreen> {
                 },
               ),
               actions: [
+                if (listing != null && listing.ok && !listing.isRoot)
+                  IconButton(
+                    tooltip: 'Get this whole folder as a zip',
+                    onPressed: () => _downloadFolder(listing),
+                    icon: const Icon(Icons.folder_zip_outlined),
+                  ),
                 IconButton(
                   tooltip: 'Refresh',
                   onPressed: _loading ? null : () => _open(_path),

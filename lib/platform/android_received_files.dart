@@ -61,13 +61,16 @@ class AndroidReceivedFiles {
     return _channel.invokeMethod<Uint8List>('thumbnail', {'uri': uri});
   }
 
-  static Future<void> openFolder() async {
-    if (!Platform.isAndroid) return;
-    await _channel.invokeMethod<void>('openFolder');
+  /// Returns null when a file manager opened, otherwise a short reason.
+  static Future<String?> openFolder() async {
+    if (!Platform.isAndroid) return null;
+    return _channel.invokeMethod<String>('openFolder');
   }
 
-  static Future<void> openFile(String uri) async {
-    if (!Platform.isAndroid) return;
-    await _channel.invokeMethod<void>('openFile', {'uri': uri});
+  /// Returns null when the file opened (or the install started), otherwise a
+  /// short reason to show the person.
+  static Future<String?> openFile(String uri) async {
+    if (!Platform.isAndroid) return null;
+    return _channel.invokeMethod<String>('openFile', {'uri': uri});
   }
 }

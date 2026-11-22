@@ -40,6 +40,7 @@ Future<void> main(List<String> args) async {
   final link = LinkController(
     prefs,
     onFileReceived: (item, from) => notifications.receivedFile(item.name, from),
+    onNotice: notifications.notice,
   );
   if (Platform.isAndroid) {
     final shareHandler = ShareHandler.instance;

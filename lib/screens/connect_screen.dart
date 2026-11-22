@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:open_filex/open_filex.dart';
 
 import '../app_scope.dart';
 import '../features/transfer_hub.dart';
@@ -13,6 +12,7 @@ import '../widgets/transfer_preview.dart';
 import '../widgets/widgets.dart';
 import 'devices_screen.dart';
 import 'files_screen.dart';
+import 'messages_screen.dart';
 import 'remote_screen.dart';
 import 'screen_screen.dart';
 
@@ -105,6 +105,18 @@ class ConnectScreen extends StatelessWidget {
                       : 'Connect a device first',
                   onTap: () => _open(context, 'Remote', const RemoteScreen()),
                 ),
+                if (!phone)
+                  ActionTile(
+                    icon: Icons.sms_outlined,
+                    title: 'Texts and calls',
+                    subtitle: peer != null
+                        ? link.phone.unreadTexts > 0
+                            ? '${link.phone.unreadTexts} new from ${peer.name}'
+                            : 'Read and send texts'
+                        : 'Connect a device first',
+                    onTap: () =>
+                        _open(context, 'Texts and calls', const MessagesScreen()),
+                  ),
               ],
             ),
           ],
@@ -147,7 +159,8 @@ class HeroCard extends StatelessWidget {
         chip = 'Connected';
         title = peer?.name ?? 'Your $other';
         detail = '${peer?.platform == 'android' ? 'Android' : 'Windows'} · '
-            'same Wi-Fi · end-to-end encrypted';
+            '${link.viaRelay ? 'over the internet' : 'same Wi-Fi'} · '
+            'end-to-end encrypted';
       case LinkStatus.connecting:
         chip = 'Connecting';
         dot = cs.amber;
@@ -290,7 +303,12 @@ class RecentTransfersCard extends StatelessWidget {
       if (item.state == TransferState.waiting) {
         return 'Waiting for the other device…';
       }
-      return '${formatBytes(item.bytes)} of ${formatBytes(item.size)}';
+      return transferProgressText(
+        item.bytes,
+        item.size,
+        item.liveSpeed,
+        item.remaining,
+      );
     }
     if (item.state == TransferState.done) {
       return '${formatBytes(item.size)} · ${item.outgoing ? 'sent' : 'received'}';
@@ -391,7 +409,7 @@ class RecentTransfersCard extends StatelessWidget {
                               Icons.open_in_new_rounded,
                               color: cs.success,
                             ),
-                            onPressed: () => OpenFilex.open(item.path!),
+                            onPressed: () => openReceivedFile(context, item),
                           ),
                       ],
                     ),
