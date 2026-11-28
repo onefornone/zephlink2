@@ -480,7 +480,8 @@ Future<void> _grabMain(List<Object?> setup) async {
 
   final frameTime = Duration(milliseconds: (1000 / math.max(1, fps)).round());
   const srcCopy = 0x00CC0020;
-  const captureBlt = 0x40000000;
+  // No CAPTUREBLT flag: it makes Windows redraw the mouse pointer on every
+  // picture, which shows up as a blinking cursor while the screen is shared.
   try {
     while (!stopped) {
       final started = DateTime.now();
@@ -497,7 +498,7 @@ Future<void> _grabMain(List<Object?> setup) async {
           final old = selectObject(memDc, bitmap);
           setStretchMode(memDc, 4); // HALFTONE: smoother when shrinking
           stretchBlt(memDc, 0, 0, outW, outH, screenDc, 0, 0, width, height,
-              srcCopy | captureBlt);
+              srcCopy);
           selectObject(memDc, old);
           if (fromHbitmap(bitmap, 0, bitmapOut) == 0) {
             final image = bitmapOut.value;
